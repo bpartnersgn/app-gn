@@ -1,0 +1,19 @@
+{
+  "name": "app-gn",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/core", "apps/api", "apps/web"],
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "dev:api": "npm run dev -w @app-gn/api",
+    "dev:web": "npm run dev -w @app-gn/web",
+    "build:web": "npm run build -w @app-gn/web",
+    "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck -w @app-gn/web",
+    "test": "node --test \"packages/*/test/**/*.test.ts\" \"apps/api/test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "typescript": "^5.9.2"
+  }
+}
