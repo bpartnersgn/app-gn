@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { CHANNEL_LABELS, CHANNELS, type Channel, type MeView, type Person, type SpaceAccess } from '@app-gn/core';
-import { createBaseClient } from './client.ts';
+import { createBaseClient, type CodeChallenge } from './client.ts';
 import { SessionContext, useOfflineStatus, useViewportChannel } from './context.ts';
 import { SPACE_KIND_LABELS, SPACE_KIND_SHORT, dateTime } from './format.ts';
 import { OfflineClient } from './offline.ts';
@@ -23,7 +23,8 @@ export function App() {
 
   useEffect(() => {
     (async () => {
-      const list = await client.base.persons();
+      // Sans connexion de démo côté serveur, la liste n'existe pas : on garde la seule connexion par NIN.
+      const list = await client.base.persons().catch(() => [] as Person[]);
       setPersons(list);
       const views = await Promise.all(list.map((person) => client.base.me({ personId: person.id, channel: 'desktop' })));
       setProfiles(Object.fromEntries(views.map((view) => [view.person.id, view])));
@@ -83,7 +84,7 @@ export function App() {
             </div>
             <div className="who">
               <span className="who-name">{me.person.fullName}</span>
-              <button type="button" className="link" onClick={() => { setPersonId(null); setMe(null); setSpaceId(null); }}>Changer d’utilisateur</button>
+              <button type="button" className="link" onClick={() => { void client.base.signOut(personId!); setPersonId(null); setMe(null); setSpaceId(null); }}>Se déconnecter</button>
             </div>
           </header>
           <OfflineBanner />
@@ -202,7 +203,8 @@ function SignIn({ persons, profiles, channel, onPick }: {
         <h1>App GN</h1>
         <p className="lede">Une seule application pour le citoyen, l’entreprise et l’administration. Comptes, wallets, cartes, crypto et documents réunis, utilisables même sans réseau.</p>
       </div>
-      <h2 className="eyebrow">Se connecter en tant que (démo)</h2>
+      <NinSignIn onSignedIn={onPick} />
+      {persons.length > 0 && <h2 className="eyebrow">Ou accès rapide (démo)</h2>}
       <ul className="persona-list">
         {persons.map((person) => {
           const view = profiles[person.id];
@@ -229,6 +231,59 @@ function SignIn({ persons, profiles, channel, onPick }: {
           : 'Les espaces entreprise et administration s’ouvrent en tableau de bord ; l’espace citoyen, en version web.'}
       </p>
     </main>
+  );
+}
+
+/** Connexion par NIN : le code arrive par SMS (montré ici en démonstration, aucun SMS n'étant branché). */
+function NinSignIn({ onSignedIn }: { onSignedIn: (personId: string) => void }) {
+  const [nin, setNin] = useState('');
+  const [code, setCode] = useState('');
+  const [challenge, setChallenge] = useState<CodeChallenge | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      if (!challenge) {
+        setChallenge(await client.base.requestCode(nin));
+      } else {
+        const { personId } = await client.base.openSession(challenge.challengeId, code);
+        onSignedIn(personId);
+      }
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="panel nin-form" onSubmit={submit} aria-labelledby="nin-title">
+      <h2 id="nin-title" className="panel-title">Se connecter avec mon NIN</h2>
+      {!challenge ? (
+        <label className="field">
+          <span>Numéro d’identification nationale</span>
+          <input id="nin" className="mono" value={nin} onChange={(event) => setNin(event.target.value)} placeholder="GN-NIN-…" autoComplete="username" required />
+        </label>
+      ) : (
+        <>
+          <p className="fine">Si ce NIN est enregistré, un code à 6 chiffres vient d’être envoyé par SMS au numéro associé. Il expire dans 5 minutes.</p>
+          {challenge.demoCode && <p className="notice notice-wait">Démo, aucun SMS envoyé : votre code est <strong className="mono">{challenge.demoCode}</strong></p>}
+          <label className="field">
+            <span>Code reçu par SMS</span>
+            <input id="otp" className="mono" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} required />
+          </label>
+        </>
+      )}
+      {error && <p className="notice notice-bad">{error}</p>}
+      <div className="nin-actions">
+        <button type="submit" className="btn btn-primary" disabled={busy}>{challenge ? 'Se connecter' : 'Recevoir un code'}</button>
+        {challenge && <button type="button" className="link" onClick={() => { setChallenge(null); setCode(''); setError(null); }}>Changer de NIN</button>}
+      </div>
+    </form>
   );
 }
 

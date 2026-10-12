@@ -71,6 +71,13 @@ Matrice complète : `packages/core/src/rbac.ts`. Un espace dont on n'est pas mem
 - entreprise : au-delà de 5 000 000 GNF, une seconde personne habilitée approuve, sauf si l'initiateur est lui-même habilité (le dirigeant ; une confirmation forte par OTP viendra avec l'authentification réelle) ;
 - administration : toujours une seconde personne. L'ordonnateur mandate, le comptable public vise et paie. Celui qui initie ne peut jamais approuver.
 
+**Connexion** (`apps/api/src/auth.ts`) : NIN, puis code à 6 chiffres envoyé par SMS au numéro de la personne, puis session.
+- `POST /v1/auth/codes {nin}` → `202 {challengeId, expiresAt}`, identique que le NIN soit connu ou non (ni l'existence de la personne ni son numéro ne se devinent) ; au plus 3 codes par NIN en 15 minutes (`429`).
+- `POST /v1/auth/sessions {challengeId, code}` → `201 {token, expiresAt, me}`. Le code vit 5 minutes, se tente 5 fois, ne sert qu'une fois ; seule son empreinte est gardée.
+- Jeton `ags1.<charge>.<HMAC-SHA256>` (clé `APPGN_SESSION_SECRET`), valable 12 h, révocable par `DELETE /v1/auth/sessions/current`. L'application le garde sur l'appareil pour rester utilisable hors ligne.
+- Aucun fournisseur SMS n'est branché : en démonstration (`APPGN_DEMO_LOGIN`, ouverte par défaut), la réponse porte le code et l'accès rapide `Bearer demo:<personId>` reste ouvert ; `APPGN_DEMO_LOGIN=off` ferme les deux.
+- Reste à faire : fournisseur SMS (agrégateur local ou opérateur), défis et révocations en base, appareil enregistré (qui fixera le format d'appareil au lieu de l'en-tête déclaré), confirmation forte par code des paiements au-delà du seuil, raccordement à l'identité numérique nationale quand elle offrira une API.
+
 ## 5. Agrégation des comptes
 
 - Un `AccountConnector` par fournisseur : `fetchBalance`, `fetchTransactions`. Le socle en a un simulé par fournisseur (Orange Money, MTN, Cellcom, Moov, Ecobank, UBA, Trésor public, carte virtuelle, wallet App GN, crypto).
@@ -144,7 +151,7 @@ Dématérialiser les supports : carte d'identité, permis, carte grise, attestat
 
 ## 11. Ce qui reste simulé ou absent
 
-- Identité : connexion de démo (`Bearer demo:<personId>`). Cible : NIN + OTP / identité numérique.
+- Identité : NIN + code SMS et sessions signées (§4), mais SMS non envoyé (code montré en démo) et état en mémoire. Cible : fournisseur SMS, base, identité numérique nationale.
 - Persistance : mémoire. Cible : PostgreSQL, comme ORCHEA.
 - Cartes et conversions : émetteur et cours simulés, frais fictifs.
 - Documents : fictifs, aucun émetteur raccordé, pas encore de signature.

@@ -118,6 +118,12 @@ export class AppGn {
     return this.deps.persons;
   }
 
+  /** Pour la connexion : la personne qui porte ce NIN (casse et espaces ignorés), ou rien. */
+  personByNin(nin: string): Person | undefined {
+    const wanted = normalizeNin(nin);
+    return wanted ? this.deps.persons.find((person) => normalizeNin(person.nin) === wanted) : undefined;
+  }
+
   me(actor: Actor): MeView {
     const person = this.person(actor.personId);
     const spaces = this.deps.memberships
@@ -512,6 +518,10 @@ function defaultLabel(destination: PaymentDestination): string {
     case 'mobile_money': return 'Envoi Mobile Money';
     case 'biller': return `Facture ${BILLERS.find((biller) => biller.id === destination.billerId)?.name ?? ''}`.trim();
   }
+}
+
+export function normalizeNin(nin: string): string {
+  return typeof nin === 'string' ? nin.toUpperCase().replace(/\s+/g, '') : '';
 }
 
 export interface DemoOptions {

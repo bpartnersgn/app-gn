@@ -1,23 +1,25 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import type { Auth } from './auth.ts';
 import type { OrcheaWebhookReceiver } from './orchea.ts';
 import { AppError, isChannel, type Actor, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type PaymentInput } from '@app-gn/core';
 
 /**
- * Authentification de démonstration : `Authorization: Bearer demo:<personId>`.
- * Elle sera remplacée par l'identité numérique (NIN + OTP / eID) ; rien d'autre ne change,
- * puisque toutes les règles d'accès vivent dans la couche application (@app-gn/core).
- */
-/**
+ * Identité : `Authorization: Bearer <jeton de session>` (connexion par NIN + code SMS, voir auth.ts) ;
+ * et, tant que la démonstration est permise, `Bearer demo:<personId>`. Toutes les règles d'accès vivent
+ * dans la couche application (@app-gn/core) : seule la façon d'établir la personne change.
+ *
  * Le format d'appareil est déclaré par le client (`AppGN-Channel: phone | tablet | desktop`, `phone` par défaut,
  * le plus restrictif). C'est une règle produit, pas une frontière de sécurité : la cible le liera à l'appareil enregistré.
  */
-function actorOf(request: FastifyRequest): Actor {
+function resolveActor(request: FastifyRequest, auth: Auth | undefined, allowDemo: boolean): Actor {
   const header = request.headers.authorization ?? '';
-  const match = /^Bearer demo:([\w-]+)$/.exec(header);
-  if (!match?.[1]) throw new AppError('unauthenticated', 'en-tête Authorization: Bearer demo:<personId> attendu');
+  const bearer = /^Bearer (\S+)$/.exec(header)?.[1];
+  const demo = allowDemo ? /^demo:([\w-]+)$/.exec(bearer ?? '')?.[1] : undefined;
+  const personId = demo ?? (bearer && auth ? auth.read(bearer)?.personId : undefined);
+  if (!personId) throw new AppError('unauthenticated', 'session absente ou expirée : connectez-vous');
   const channel = request.headers['appgn-channel'] ?? 'phone';
   if (!isChannel(channel)) throw new AppError('invalid_request', 'AppGN-Channel : phone, tablet ou desktop');
-  return { personId: match[1], channel };
+  return { personId, channel };
 }
 
 function keyOf(request: FastifyRequest): string {
@@ -25,8 +27,20 @@ function keyOf(request: FastifyRequest): string {
   return typeof key === 'string' ? key : '';
 }
 
-export function buildServer(app: AppGn, options: { logger?: boolean; orcheaWebhooks?: OrcheaWebhookReceiver } = {}): FastifyInstance {
+export interface ServerOptions {
+  logger?: boolean;
+  orcheaWebhooks?: OrcheaWebhookReceiver;
+  /** Connexion par NIN + code SMS. */
+  auth?: Auth;
+  /** Accepter `Bearer demo:<personId>` et la liste des personnes de démo. Par défaut : oui. */
+  demoLogin?: boolean;
+}
+
+export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyInstance {
   const server = Fastify({ logger: options.logger ?? false });
+  const auth = options.auth;
+  const demoLogin = options.demoLogin ?? true;
+  const actorOf = (request: FastifyRequest) => resolveActor(request, auth, demoLogin);
 
   server.setErrorHandler((error, _request, reply: FastifyReply) => {
     if (error instanceof AppError) {
@@ -55,7 +69,22 @@ export function buildServer(app: AppGn, options: { logger?: boolean; orcheaWebho
     });
   }
 
-  server.get('/v1/demo/persons', async () => app.listPersons());
+  if (demoLogin) server.get('/v1/demo/persons', async () => app.listPersons());
+
+  if (auth) {
+    server.post<{ Body: { nin?: unknown } }>('/v1/auth/codes', async (request, reply) =>
+      reply.status(202).send(await auth.requestCode(request.body?.nin)));
+    server.post<{ Body: { challengeId?: unknown; code?: unknown } }>('/v1/auth/sessions', async (request, reply) => {
+      const { token, session } = auth.verifyCode(request.body?.challengeId, request.body?.code);
+      return reply.status(201).send({ token, expiresAt: session.expiresAt, me: app.me({ personId: session.personId, channel: 'phone' }) });
+    });
+    server.delete('/v1/auth/sessions/current', async (request, reply) => {
+      const bearer = /^Bearer (\S+)$/.exec(request.headers.authorization ?? '')?.[1];
+      const session = bearer ? auth.read(bearer) : undefined;
+      if (session) auth.revoke(session);
+      return reply.status(204).send();
+    });
+  }
   server.get('/v1/catalog', async () => app.catalog());
 
   server.get('/v1/me', async (request) => app.me(actorOf(request)));

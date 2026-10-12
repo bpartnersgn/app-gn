@@ -20,8 +20,19 @@ import {
 } from '@app-gn/core';
 
 /** Ce dont l'interface a besoin, servi soit par l'API HTTP, soit par le noyau embarqué (mode démo). */
+export interface CodeChallenge {
+  challengeId: string;
+  expiresAt: string;
+  /** Démonstration seulement : aucun SMS ne part, le code est rendu ici. */
+  demoCode?: string;
+}
+
 export interface AppGnClient {
   readonly mode: 'api' | 'embedded';
+  /** Connexion : NIN → code par SMS → session. */
+  requestCode(nin: string): Promise<CodeChallenge>;
+  openSession(challengeId: string, code: string): Promise<{ personId: string }>;
+  signOut(personId: string): Promise<void>;
   persons(): Promise<Person[]>;
   me(actor: Actor): Promise<MeView>;
   overview(actor: Actor, spaceId: string): Promise<ConsolidatedView>;
@@ -51,11 +62,51 @@ export class ClientError extends Error {
 /** Code réservé aux pannes de réseau : tout autre code est une réponse du serveur. */
 export const NETWORK_ERROR = 'network';
 
+const SESSIONS_KEY = 'appgn.sessions';
+
+/** Jetons de session par personne, gardés sur l'appareil pour rester connecté hors ligne. */
+function loadSessions(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(SESSIONS_KEY) ?? '{}') as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions: Record<string, string>): void {
+  try {
+    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+  } catch {
+    // Stockage indisponible (navigation privée) : la session vit le temps de la page.
+  }
+}
+
 class HttpClient implements AppGnClient {
   readonly mode = 'api' as const;
   private readonly base: string;
+  private readonly sessions = loadSessions();
   constructor(base: string) {
     this.base = base.replace(/\/$/, '');
+  }
+
+  private authorization(personId: string): string {
+    const token = this.sessions[personId];
+    return token ? `Bearer ${token}` : `Bearer demo:${personId}`;
+  }
+
+  requestCode(nin: string) { return this.call<CodeChallenge>(null, 'POST', '/v1/auth/codes', { nin }); }
+  async openSession(challengeId: string, code: string) {
+    const { token, me } = await this.call<{ token: string; me: MeView }>(null, 'POST', '/v1/auth/sessions', { challengeId, code });
+    this.sessions[me.person.id] = token;
+    saveSessions(this.sessions);
+    return { personId: me.person.id };
+  }
+  async signOut(personId: string) {
+    const token = this.sessions[personId];
+    if (!token) return;
+    delete this.sessions[personId];
+    saveSessions(this.sessions);
+    await this.call<void>(null, 'DELETE', '/v1/auth/sessions/current', undefined, { authorization: `Bearer ${token}` }).catch(() => undefined);
   }
 
   private async call<T>(actor: Actor | null, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
@@ -64,7 +115,7 @@ class HttpClient implements AppGnClient {
       response = await fetch(`${this.base}${path}`, {
         method,
         headers: {
-          ...(actor ? { authorization: `Bearer demo:${actor.personId}`, 'appgn-channel': actor.channel } : {}),
+          ...(actor ? { authorization: this.authorization(actor.personId), 'appgn-channel': actor.channel } : {}),
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
           ...headers,
         },
@@ -73,6 +124,7 @@ class HttpClient implements AppGnClient {
     } catch {
       throw new ClientError(NETWORK_ERROR, 'réseau indisponible');
     }
+    if (response.status === 204) return undefined as T;
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new ClientError(payload.error ?? 'http_error', payload.message ?? `HTTP ${response.status}`);
     return payload as T;
@@ -109,6 +161,27 @@ class HttpClient implements AppGnClient {
 class EmbeddedClient implements AppGnClient {
   readonly mode = 'embedded' as const;
   private readonly app = createDemoApp().app;
+  private readonly challenges = new Map<string, { personId?: string; code: string; expiresAt: number }>();
+
+  // Démonstration sans serveur : même parcours que l'API, le code est montré au lieu d'être envoyé par SMS.
+  async requestCode(nin: string): Promise<CodeChallenge> {
+    if (nin.trim().length < 6) throw new ClientError('invalid_request', 'NIN requis');
+    const person = this.app.personByNin(nin);
+    const challengeId = crypto.randomUUID();
+    const code = String(Math.floor(Math.random() * 1_000_000)).padStart(6, '0');
+    const expiresAt = Date.now() + 5 * 60_000;
+    this.challenges.set(challengeId, { personId: person?.id, code, expiresAt });
+    return { challengeId, expiresAt: new Date(expiresAt).toISOString(), ...(person ? { demoCode: code } : {}) };
+  }
+  async openSession(challengeId: string, code: string) {
+    const challenge = this.challenges.get(challengeId);
+    if (!challenge?.personId || challenge.code !== code.trim() || challenge.expiresAt < Date.now()) {
+      throw new ClientError('unauthenticated', 'code incorrect ou expiré');
+    }
+    this.challenges.delete(challengeId);
+    return { personId: challenge.personId };
+  }
+  async signOut() {}
 
   private async run<T>(work: () => T | Promise<T>): Promise<T> {
     try {
