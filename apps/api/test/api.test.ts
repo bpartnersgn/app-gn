@@ -7,7 +7,7 @@ function server() {
   return buildServer(createDemoApp({ aggregationTimeoutMs: 50 }).app);
 }
 
-const as = (personId: string) => ({ authorization: `Bearer demo:${personId}` });
+const as = (personId: string, channel = 'desktop') => ({ authorization: `Bearer demo:${personId}`, 'appgn-channel': channel });
 
 describe('API', () => {
   it('exige une identité', async () => {
@@ -54,5 +54,36 @@ describe('API', () => {
       payload: { sourceAccountId: 'acc_mc_om', amount: '1000', destination: { type: 'own_account', accountId: 'acc_mc_mtn' } },
     });
     assert.equal(response.statusCode, 400);
+  });
+
+  it('refuse l\u2019espace entreprise depuis un téléphone', async () => {
+    const response = await server().inject({ method: 'GET', url: '/v1/spaces/spc_biz_boke/overview', headers: as('per_alpha', 'phone') });
+    assert.equal(response.statusCode, 403);
+    assert.equal(response.json().error, 'channel_not_allowed');
+  });
+
+  it('vérifie un document sans authentification et sert le coffre à son porteur', async () => {
+    const app = server();
+    const check = await app.inject({ method: 'GET', url: '/v1/document-checks/GN-PC-9D2F-H7RT' });
+    assert.equal(check.statusCode, 200);
+    assert.equal(check.json().holderName, 'Mariama Camara');
+    const vault = await app.inject({ method: 'GET', url: '/v1/spaces/spc_cit_mariama/documents', headers: as('per_mariama', 'phone') });
+    assert.equal(vault.statusCode, 200);
+    assert.ok(vault.json().length >= 5);
+  });
+
+  it('devis puis conversion', async () => {
+    const app = server();
+    const quote = await app.inject({
+      method: 'POST', url: '/v1/spaces/spc_cit_mariama/exchange-quotes', headers: as('per_mariama', 'phone'),
+      payload: { sourceAccountId: 'acc_mc_usdt', targetAccountId: 'acc_mc_om', amount: '20' },
+    });
+    assert.equal(quote.statusCode, 201);
+    const done = await app.inject({
+      method: 'POST', url: '/v1/spaces/spc_cit_mariama/exchanges', headers: { ...as('per_mariama', 'phone'), 'idempotency-key': 'e1' },
+      payload: { quoteId: quote.json().id },
+    });
+    assert.equal(done.statusCode, 201);
+    assert.equal(done.json().status, 'completed');
   });
 });

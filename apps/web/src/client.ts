@@ -2,7 +2,16 @@ import {
   AppError,
   createDemoApp,
   type AccountTransaction,
+  type Actor,
+  type CardNetwork,
+  type CardTier,
+  type CardView,
   type ConsolidatedView,
+  type DocumentVerification,
+  type DocumentView,
+  type Exchange,
+  type ExchangeInput,
+  type ExchangeQuote,
   type MeView,
   type Payment,
   type PaymentInput,
@@ -14,14 +23,21 @@ import {
 export interface AppGnClient {
   readonly mode: 'api' | 'embedded';
   persons(): Promise<Person[]>;
-  me(personId: string): Promise<MeView>;
-  overview(personId: string, spaceId: string): Promise<ConsolidatedView>;
-  services(personId: string, spaceId: string): Promise<ServiceDefinition[]>;
-  transactions(personId: string, spaceId: string, accountId: string): Promise<AccountTransaction[]>;
-  payments(personId: string, spaceId: string): Promise<Payment[]>;
-  pay(personId: string, spaceId: string, input: PaymentInput, idempotencyKey: string): Promise<Payment>;
-  approve(personId: string, spaceId: string, paymentId: string): Promise<Payment>;
-  reject(personId: string, spaceId: string, paymentId: string): Promise<Payment>;
+  me(actor: Actor): Promise<MeView>;
+  overview(actor: Actor, spaceId: string): Promise<ConsolidatedView>;
+  services(actor: Actor, spaceId: string): Promise<ServiceDefinition[]>;
+  transactions(actor: Actor, spaceId: string, accountId: string): Promise<AccountTransaction[]>;
+  payments(actor: Actor, spaceId: string): Promise<Payment[]>;
+  pay(actor: Actor, spaceId: string, input: PaymentInput, idempotencyKey: string): Promise<Payment>;
+  approve(actor: Actor, spaceId: string, paymentId: string): Promise<Payment>;
+  reject(actor: Actor, spaceId: string, paymentId: string): Promise<Payment>;
+  documents(actor: Actor, spaceId: string): Promise<DocumentView[]>;
+  verifyDocument(code: string): Promise<DocumentVerification>;
+  cards(actor: Actor, spaceId: string): Promise<CardView[]>;
+  issueCard(actor: Actor, spaceId: string, request: { network: CardNetwork; tier: CardTier }, idempotencyKey: string): Promise<CardView>;
+  setCardFrozen(actor: Actor, spaceId: string, accountId: string, frozen: boolean): Promise<CardView>;
+  quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput): Promise<ExchangeQuote>;
+  executeExchange(actor: Actor, spaceId: string, quoteId: string, idempotencyKey: string): Promise<Exchange>;
 }
 
 export class ClientError extends Error {
@@ -32,6 +48,9 @@ export class ClientError extends Error {
   }
 }
 
+/** Code réservé aux pannes de réseau : tout autre code est une réponse du serveur. */
+export const NETWORK_ERROR = 'network';
+
 class HttpClient implements AppGnClient {
   readonly mode = 'api' as const;
   private readonly base: string;
@@ -39,34 +58,52 @@ class HttpClient implements AppGnClient {
     this.base = base.replace(/\/$/, '');
   }
 
-  private async call<T>(personId: string | null, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
-    const response = await fetch(`${this.base}${path}`, {
-      method,
-      headers: {
-        ...(personId ? { authorization: `Bearer demo:${personId}` } : {}),
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-        ...headers,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
+  private async call<T>(actor: Actor | null, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.base}${path}`, {
+        method,
+        headers: {
+          ...(actor ? { authorization: `Bearer demo:${actor.personId}`, 'appgn-channel': actor.channel } : {}),
+          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          ...headers,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch {
+      throw new ClientError(NETWORK_ERROR, 'réseau indisponible');
+    }
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) throw new ClientError(payload.error ?? 'http_error', payload.message ?? `HTTP ${response.status}`);
     return payload as T;
   }
 
   persons() { return this.call<Person[]>(null, 'GET', '/v1/demo/persons'); }
-  me(personId: string) { return this.call<MeView>(personId, 'GET', '/v1/me'); }
-  overview(personId: string, spaceId: string) { return this.call<ConsolidatedView>(personId, 'GET', `/v1/spaces/${spaceId}/overview`); }
-  services(personId: string, spaceId: string) { return this.call<ServiceDefinition[]>(personId, 'GET', `/v1/spaces/${spaceId}/services`); }
-  transactions(personId: string, spaceId: string, accountId: string) {
-    return this.call<AccountTransaction[]>(personId, 'GET', `/v1/spaces/${spaceId}/accounts/${accountId}/transactions?limit=8`);
+  me(actor: Actor) { return this.call<MeView>(actor, 'GET', '/v1/me'); }
+  overview(actor: Actor, spaceId: string) { return this.call<ConsolidatedView>(actor, 'GET', `/v1/spaces/${spaceId}/overview`); }
+  services(actor: Actor, spaceId: string) { return this.call<ServiceDefinition[]>(actor, 'GET', `/v1/spaces/${spaceId}/services`); }
+  transactions(actor: Actor, spaceId: string, accountId: string) {
+    return this.call<AccountTransaction[]>(actor, 'GET', `/v1/spaces/${spaceId}/accounts/${accountId}/transactions?limit=8`);
   }
-  payments(personId: string, spaceId: string) { return this.call<Payment[]>(personId, 'GET', `/v1/spaces/${spaceId}/payments`); }
-  pay(personId: string, spaceId: string, input: PaymentInput, idempotencyKey: string) {
-    return this.call<Payment>(personId, 'POST', `/v1/spaces/${spaceId}/payments`, input, { 'idempotency-key': idempotencyKey });
+  payments(actor: Actor, spaceId: string) { return this.call<Payment[]>(actor, 'GET', `/v1/spaces/${spaceId}/payments`); }
+  pay(actor: Actor, spaceId: string, input: PaymentInput, idempotencyKey: string) {
+    return this.call<Payment>(actor, 'POST', `/v1/spaces/${spaceId}/payments`, input, { 'idempotency-key': idempotencyKey });
   }
-  approve(personId: string, spaceId: string, paymentId: string) { return this.call<Payment>(personId, 'POST', `/v1/spaces/${spaceId}/payments/${paymentId}/approve`, {}); }
-  reject(personId: string, spaceId: string, paymentId: string) { return this.call<Payment>(personId, 'POST', `/v1/spaces/${spaceId}/payments/${paymentId}/reject`, {}); }
+  approve(actor: Actor, spaceId: string, paymentId: string) { return this.call<Payment>(actor, 'POST', `/v1/spaces/${spaceId}/payments/${paymentId}/approve`, {}); }
+  reject(actor: Actor, spaceId: string, paymentId: string) { return this.call<Payment>(actor, 'POST', `/v1/spaces/${spaceId}/payments/${paymentId}/reject`, {}); }
+  documents(actor: Actor, spaceId: string) { return this.call<DocumentView[]>(actor, 'GET', `/v1/spaces/${spaceId}/documents`); }
+  verifyDocument(code: string) { return this.call<DocumentVerification>(null, 'GET', `/v1/document-checks/${encodeURIComponent(code)}`); }
+  cards(actor: Actor, spaceId: string) { return this.call<CardView[]>(actor, 'GET', `/v1/spaces/${spaceId}/cards`); }
+  issueCard(actor: Actor, spaceId: string, request: { network: CardNetwork; tier: CardTier }, key: string) {
+    return this.call<CardView>(actor, 'POST', `/v1/spaces/${spaceId}/cards`, request, { 'idempotency-key': key });
+  }
+  setCardFrozen(actor: Actor, spaceId: string, accountId: string, frozen: boolean) {
+    return this.call<CardView>(actor, 'POST', `/v1/spaces/${spaceId}/cards/${accountId}/${frozen ? 'freeze' : 'unfreeze'}`, {});
+  }
+  quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput) { return this.call<ExchangeQuote>(actor, 'POST', `/v1/spaces/${spaceId}/exchange-quotes`, input); }
+  executeExchange(actor: Actor, spaceId: string, quoteId: string, key: string) {
+    return this.call<Exchange>(actor, 'POST', `/v1/spaces/${spaceId}/exchanges`, { quoteId }, { 'idempotency-key': key });
+  }
 }
 
 class EmbeddedClient implements AppGnClient {
@@ -84,17 +121,24 @@ class EmbeddedClient implements AppGnClient {
   }
 
   persons() { return this.run(() => this.app.listPersons()); }
-  me(personId: string) { return this.run(() => this.app.me(personId)); }
-  overview(personId: string, spaceId: string) { return this.run(() => this.app.overview(personId, spaceId)); }
-  services(personId: string, spaceId: string) { return this.run(() => this.app.services(personId, spaceId)); }
-  transactions(personId: string, spaceId: string, accountId: string) { return this.run(() => this.app.transactions(personId, spaceId, accountId, 8)); }
-  payments(personId: string, spaceId: string) { return this.run(() => this.app.listPayments(personId, spaceId)); }
-  pay(personId: string, spaceId: string, input: PaymentInput, key: string) { return this.run(() => this.app.initiatePayment(personId, spaceId, input, key)); }
-  approve(personId: string, spaceId: string, paymentId: string) { return this.run(() => this.app.approvePayment(personId, spaceId, paymentId)); }
-  reject(personId: string, spaceId: string, paymentId: string) { return this.run(() => this.app.rejectPayment(personId, spaceId, paymentId)); }
+  me(actor: Actor) { return this.run(() => this.app.me(actor)); }
+  overview(actor: Actor, spaceId: string) { return this.run(() => this.app.overview(actor, spaceId)); }
+  services(actor: Actor, spaceId: string) { return this.run(() => this.app.services(actor, spaceId)); }
+  transactions(actor: Actor, spaceId: string, accountId: string) { return this.run(() => this.app.transactions(actor, spaceId, accountId, 8)); }
+  payments(actor: Actor, spaceId: string) { return this.run(() => this.app.listPayments(actor, spaceId)); }
+  pay(actor: Actor, spaceId: string, input: PaymentInput, key: string) { return this.run(() => this.app.initiatePayment(actor, spaceId, input, key)); }
+  approve(actor: Actor, spaceId: string, paymentId: string) { return this.run(() => this.app.approvePayment(actor, spaceId, paymentId)); }
+  reject(actor: Actor, spaceId: string, paymentId: string) { return this.run(() => this.app.rejectPayment(actor, spaceId, paymentId)); }
+  documents(actor: Actor, spaceId: string) { return this.run(() => this.app.documents(actor, spaceId)); }
+  verifyDocument(code: string) { return this.run(() => this.app.verifyDocument(code)); }
+  cards(actor: Actor, spaceId: string) { return this.run(() => this.app.cards(actor, spaceId)); }
+  issueCard(actor: Actor, spaceId: string, request: { network: CardNetwork; tier: CardTier }, key: string) { return this.run(() => this.app.issueCard(actor, spaceId, request, key)); }
+  setCardFrozen(actor: Actor, spaceId: string, accountId: string, frozen: boolean) { return this.run(() => this.app.setCardFrozen(actor, spaceId, accountId, frozen)); }
+  quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput) { return this.run(() => this.app.quoteExchange(actor, spaceId, input)); }
+  executeExchange(actor: Actor, spaceId: string, quoteId: string, key: string) { return this.run(() => this.app.executeExchange(actor, spaceId, quoteId, key)); }
 }
 
-export function createClient(): AppGnClient {
+export function createBaseClient(): AppGnClient {
   const base = import.meta.env.VITE_API_URL as string | undefined;
   return base ? new HttpClient(base === '/' ? '' : base) : new EmbeddedClient();
 }

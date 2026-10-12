@@ -1,4 +1,5 @@
 import type { SimulatedNetwork } from './connectors.ts';
+import type { VirtualCard } from './cards.ts';
 import type { AccountTransaction, LinkedAccount, Membership, Person, Space } from './model.ts';
 import { CURRENCIES, money, type Currency, type FxTable } from './money.ts';
 
@@ -93,6 +94,7 @@ export interface DemoData {
   spaces: Space[];
   memberships: Membership[];
   accounts: LinkedAccount[];
+  cards: VirtualCard[];
 }
 
 /** Charge les données fictives dans le réseau simulé ; l'historique couvre les 30 jours précédant `now`. */
@@ -116,6 +118,9 @@ export function seedDemo(network: SimulatedNetwork, now: Date): DemoData {
     spaces: structuredClone(DEMO_SPACES),
     memberships: structuredClone(DEMO_MEMBERSHIPS),
     accounts,
+    cards: [
+      { accountId: 'acc_mc_card', spaceId: 'spc_cit_mariama', network: 'visa', tier: 'standard', status: 'active', last4: '7310', expiry: '08/28', holderName: 'Mariama Camara' },
+    ],
   };
 }
 

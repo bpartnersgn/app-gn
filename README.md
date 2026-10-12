@@ -1,18 +1,22 @@
 # App GN
 
-Une seule application pour le **citoyen**, l'**entreprise** (GAPP) et l'**administration** (GAPP Institutionnel). Elle agrège tous les moyens de paiement d'une personne ou d'une organisation (comptes bancaires, wallets Mobile Money, carte virtuelle, wallet App GN, crypto) dans une vue consolidée, et les relie à des services. Chaque profil a son accès et sa logique métier.
+Une seule application pour le **citoyen** (application mobile ou web), l'**entreprise** (GAPP) et l'**administration** (GAPP Institutionnel), ces deux dernières en tableau de bord sur ordinateur ou tablette. Elle agrège tous les moyens de paiement (comptes bancaires, wallets Mobile Money, cartes virtuelles, wallet App GN, crypto) dans une vue consolidée, garde les documents dématérialisés, et reste utilisable sans réseau. Chaque profil a son accès et sa logique métier.
 
 Les paiements passent par l'orchestrateur [ORCHEA](https://github.com/orcheagn/-orchea-payment) (XeyLink Router), dans son propre dépôt.
 
-**État : socle v0.1.0.** Données fictives et connecteurs simulés : aucun fournisseur réel n'est appelé, aucun argent ne bouge.
+**État : socle v0.2.0.** Données fictives et connecteurs simulés : aucun fournisseur réel n'est appelé, aucun argent ne bouge.
 
 ## Ce que fait le socle
 - Trois espaces dans la même application, un sélecteur pour passer de l'un à l'autre, un rôle par espace.
 - Vue consolidée de tous les comptes en GNF (contre-valeur indicative), résistante à la panne d'un fournisseur.
 - Paiements (facture, Mobile Money, entre comptes) avec idempotence et règles d'approbation par profil : seuil de 5 M GNF côté entreprise, séparation ordonnateur / comptable public côté administration.
 - Catalogue de services filtré par rôle (branchés et prévus).
+- Canaux : espace citoyen sur tout appareil (mise en page application sur téléphone), espaces pro en tableau de bord sur tablette ou ordinateur seulement.
+- Hors ligne d'abord : écrans servis depuis l'appareil, paiements du citoyen mis en file et rejoués sans double débit, expiration après 24 h ; application installable.
+- Coffre de documents : identité, permis, carte grise, assurances, abonnements, attestations d'entreprise ; alerte avant expiration ; vérification par code.
+- Cartes virtuelles et conversions sur le modèle de Keecash : plusieurs cartes, blocage instantané, recharge depuis Mobile Money ou crypto avec devis (frais et cours) avant confirmation.
 
-Architecture : [docs/architecture.md](docs/architecture.md). Décision de socle : [docs/adr/adr-001-socle.md](docs/adr/adr-001-socle.md).
+Architecture : [docs/architecture.md](docs/architecture.md). Décisions : [ADR-001](docs/adr/adr-001-socle.md), [ADR-002](docs/adr/adr-002-canaux-hors-ligne-documents-cartes.md).
 
 ## Démarrer
 Node ≥ 22.18.
@@ -33,7 +37,7 @@ VITE_API_URL=/ npm run dev:web
 Utilisateurs de démo : Mariama Camara (citoyenne, dirigeante de Couture Mariama), Alpha Diallo (directeur financier de Boké Logistique), Sékou Condé (dirigeant de Boké Logistique), Fatoumata Bah (ordonnatrice, Commune de Kaloum), Ibrahima Sylla (comptable public, Commune de Kaloum).
 
 ## API (v1)
-Authentification de démo : `Authorization: Bearer demo:<personId>`.
+Authentification de démo : `Authorization: Bearer demo:<personId>`. Format d'appareil : `AppGN-Channel: phone | tablet | desktop` (`phone` par défaut).
 
 | Méthode | Chemin | |
 |---|---|---|
@@ -43,6 +47,11 @@ Authentification de démo : `Authorization: Bearer demo:<personId>`.
 | GET | `/v1/spaces/:spaceId/services` | services accessibles au rôle |
 | GET/POST | `/v1/spaces/:spaceId/payments` | lister / initier (`Idempotency-Key` requise) |
 | POST | `/v1/spaces/:spaceId/payments/:id/approve` · `/reject` | décider d'un paiement en attente |
+| GET | `/v1/spaces/:spaceId/documents` | coffre de documents |
+| GET | `/v1/document-checks/:code` | vérification publique d'un document |
+| GET/POST | `/v1/spaces/:spaceId/cards` | lister / émettre une carte virtuelle |
+| POST | `/v1/spaces/:spaceId/cards/:accountId/freeze` · `/unfreeze` | bloquer / débloquer |
+| POST | `/v1/spaces/:spaceId/exchange-quotes` puis `/exchanges` | devis puis conversion |
 
 ## Structure
 - `packages/core` — règles : profils et droits, agrégation, paiements, catalogue, montants

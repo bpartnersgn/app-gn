@@ -1,16 +1,27 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
-import { AppError, type AppGn, type PaymentInput } from '@app-gn/core';
+import { AppError, isChannel, type Actor, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type PaymentInput } from '@app-gn/core';
 
 /**
  * Authentification de démonstration : `Authorization: Bearer demo:<personId>`.
  * Elle sera remplacée par l'identité numérique (NIN + OTP / eID) ; rien d'autre ne change,
  * puisque toutes les règles d'accès vivent dans la couche application (@app-gn/core).
  */
-function personOf(request: FastifyRequest): string {
+/**
+ * Le format d'appareil est déclaré par le client (`AppGN-Channel: phone | tablet | desktop`, `phone` par défaut,
+ * le plus restrictif). C'est une règle produit, pas une frontière de sécurité : la cible le liera à l'appareil enregistré.
+ */
+function actorOf(request: FastifyRequest): Actor {
   const header = request.headers.authorization ?? '';
   const match = /^Bearer demo:([\w-]+)$/.exec(header);
   if (!match?.[1]) throw new AppError('unauthenticated', 'en-tête Authorization: Bearer demo:<personId> attendu');
-  return match[1];
+  const channel = request.headers['appgn-channel'] ?? 'phone';
+  if (!isChannel(channel)) throw new AppError('invalid_request', 'AppGN-Channel : phone, tablet ou desktop');
+  return { personId: match[1], channel };
+}
+
+function keyOf(request: FastifyRequest): string {
+  const key = request.headers['idempotency-key'];
+  return typeof key === 'string' ? key : '';
 }
 
 export function buildServer(app: AppGn, options: { logger?: boolean } = {}): FastifyInstance {
@@ -31,33 +42,60 @@ export function buildServer(app: AppGn, options: { logger?: boolean } = {}): Fas
   server.get('/v1/demo/persons', async () => app.listPersons());
   server.get('/v1/catalog', async () => app.catalog());
 
-  server.get('/v1/me', async (request) => app.me(personOf(request)));
+  server.get('/v1/me', async (request) => app.me(actorOf(request)));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/overview', async (request) =>
-    app.overview(personOf(request), request.params.spaceId));
+    app.overview(actorOf(request), request.params.spaceId));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/services', async (request) =>
-    app.services(personOf(request), request.params.spaceId));
+    app.services(actorOf(request), request.params.spaceId));
 
   server.get<{ Params: { spaceId: string; accountId: string }; Querystring: { limit?: string } }>(
     '/v1/spaces/:spaceId/accounts/:accountId/transactions',
-    async (request) => app.transactions(personOf(request), request.params.spaceId, request.params.accountId, Number(request.query.limit ?? 20) || 20),
+    async (request) => app.transactions(actorOf(request), request.params.spaceId, request.params.accountId, Number(request.query.limit ?? 20) || 20),
   );
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/payments', async (request) =>
-    app.listPayments(personOf(request), request.params.spaceId));
+    app.listPayments(actorOf(request), request.params.spaceId));
 
   server.post<{ Params: { spaceId: string }; Body: PaymentInput }>('/v1/spaces/:spaceId/payments', async (request, reply) => {
-    const key = request.headers['idempotency-key'];
-    const payment = await app.initiatePayment(personOf(request), request.params.spaceId, request.body ?? ({} as PaymentInput), typeof key === 'string' ? key : '');
+    const payment = await app.initiatePayment(actorOf(request), request.params.spaceId, request.body ?? ({} as PaymentInput), keyOf(request));
     return reply.status(201).send(payment);
   });
 
   server.post<{ Params: { spaceId: string; paymentId: string } }>('/v1/spaces/:spaceId/payments/:paymentId/approve', async (request) =>
-    app.approvePayment(personOf(request), request.params.spaceId, request.params.paymentId));
+    app.approvePayment(actorOf(request), request.params.spaceId, request.params.paymentId));
 
   server.post<{ Params: { spaceId: string; paymentId: string } }>('/v1/spaces/:spaceId/payments/:paymentId/reject', async (request) =>
-    app.rejectPayment(personOf(request), request.params.spaceId, request.params.paymentId));
+    app.rejectPayment(actorOf(request), request.params.spaceId, request.params.paymentId));
+
+  server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/documents', async (request) =>
+    app.documents(actorOf(request), request.params.spaceId));
+
+  // Public : ce qu'un contrôleur voit en saisissant le code d'un document.
+  server.get<{ Params: { code: string } }>('/v1/document-checks/:code', async (request) => app.verifyDocument(request.params.code));
+
+  server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/cards', async (request) =>
+    app.cards(actorOf(request), request.params.spaceId));
+
+  server.post<{ Params: { spaceId: string }; Body: { network: CardNetwork; tier: CardTier; currency?: Currency } }>('/v1/spaces/:spaceId/cards', async (request, reply) => {
+    const card = await app.issueCard(actorOf(request), request.params.spaceId, request.body ?? ({} as never), keyOf(request));
+    return reply.status(201).send(card);
+  });
+
+  server.post<{ Params: { spaceId: string; accountId: string } }>('/v1/spaces/:spaceId/cards/:accountId/freeze', async (request) =>
+    app.setCardFrozen(actorOf(request), request.params.spaceId, request.params.accountId, true));
+
+  server.post<{ Params: { spaceId: string; accountId: string } }>('/v1/spaces/:spaceId/cards/:accountId/unfreeze', async (request) =>
+    app.setCardFrozen(actorOf(request), request.params.spaceId, request.params.accountId, false));
+
+  server.post<{ Params: { spaceId: string }; Body: ExchangeInput }>('/v1/spaces/:spaceId/exchange-quotes', async (request, reply) =>
+    reply.status(201).send(app.quoteExchange(actorOf(request), request.params.spaceId, request.body ?? ({} as ExchangeInput))));
+
+  server.post<{ Params: { spaceId: string }; Body: { quoteId: string } }>('/v1/spaces/:spaceId/exchanges', async (request, reply) => {
+    const exchange = await app.executeExchange(actorOf(request), request.params.spaceId, request.body?.quoteId ?? '', keyOf(request));
+    return reply.status(201).send(exchange);
+  });
 
   return server;
 }

@@ -8,4 +8,8 @@ export * from './services.ts';
 export * from './payments.ts';
 export * from './errors.ts';
 export * from './seed.ts';
+export * from './channels.ts';
+export * from './documents.ts';
+export * from './cards.ts';
+export * from './sync.ts';
 export * from './app.ts';

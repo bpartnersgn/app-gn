@@ -7,7 +7,8 @@ export type ErrorCode =
   | 'idempotency_conflict'
   | 'insufficient_funds'
   | 'invalid_state'
-  | 'separation_of_duties';
+  | 'separation_of_duties'
+  | 'channel_not_allowed';
 
 const STATUS: Record<ErrorCode, number> = {
   unauthenticated: 401,
@@ -19,6 +20,7 @@ const STATUS: Record<ErrorCode, number> = {
   insufficient_funds: 422,
   invalid_state: 409,
   separation_of_duties: 403,
+  channel_not_allowed: 403,
 };
 
 export class AppError extends Error {

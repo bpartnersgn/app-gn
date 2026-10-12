@@ -79,3 +79,21 @@ export function formatMoney(value: Money, locale = 'fr-FR'): string {
   const separator = (1.5).toLocaleString(locale).charAt(1);
   return `${negative ? '-' : ''}${groupedWhole}${minFraction ? separator + minFraction : ''} ${value.currency}`;
 }
+
+function gnfPerMajor(currency: Currency, fx: FxTable): bigint | undefined {
+  return currency === REFERENCE_CURRENCY ? 1n : fx[currency];
+}
+
+/**
+ * Conversion d'une devise à l'autre en passant par le GNF, arrondie vers le bas (jamais en faveur du client
+ * au-delà de ce qui est affiché). Rend null si un taux manque.
+ */
+export function convert(value: Money, target: Currency, fx: FxTable): Money | null {
+  if (value.currency === target) return value;
+  const sourceRate = gnfPerMajor(value.currency, fx);
+  const targetRate = gnfPerMajor(target, fx);
+  if (sourceRate === undefined || targetRate === undefined) return null;
+  const numerator = toBigInt(value) * sourceRate * 10n ** BigInt(CURRENCIES[target].decimals);
+  const denominator = 10n ** BigInt(CURRENCIES[value.currency].decimals) * targetRate;
+  return money(numerator / denominator, target);
+}

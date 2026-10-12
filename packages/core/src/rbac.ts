@@ -10,7 +10,10 @@ export type Permission =
   | 'payroll:submit'
   | 'budget:read'
   | 'reports:read'
-  | 'members:manage';
+  | 'members:manage'
+  | 'documents:read'
+  | 'documents:write'
+  | 'cards:manage';
 
 export const ROLE_SPACE_KIND: Record<Role, SpaceKind> = {
   citizen: 'citizen',
@@ -40,17 +43,17 @@ export const ROLE_LABELS: Record<Role, string> = {
  * (celui qui initie ne peut pas approuver, voir payments.ts).
  */
 export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
-  citizen: ['accounts:read', 'accounts:link', 'payments:initiate', 'payments:approve'],
+  citizen: ['accounts:read', 'accounts:link', 'payments:initiate', 'payments:approve', 'documents:read', 'documents:write', 'cards:manage'],
   business_owner: [
     'accounts:read', 'accounts:link', 'payments:initiate', 'payments:approve',
-    'invoices:write', 'tax:declare', 'payroll:submit', 'reports:read', 'members:manage',
+    'invoices:write', 'tax:declare', 'payroll:submit', 'reports:read', 'members:manage', 'documents:read', 'documents:write',
   ],
-  business_finance: ['accounts:read', 'accounts:link', 'payments:initiate', 'invoices:write', 'tax:declare', 'reports:read'],
-  business_accountant: ['accounts:read', 'invoices:write', 'reports:read'],
-  business_hr: ['accounts:read', 'payroll:submit'],
-  admin_authorizing_officer: ['accounts:read', 'payments:initiate', 'payroll:submit', 'budget:read', 'reports:read'],
-  admin_public_accountant: ['accounts:read', 'payments:approve', 'budget:read', 'reports:read'],
-  admin_viewer: ['accounts:read', 'budget:read', 'reports:read'],
+  business_finance: ['accounts:read', 'accounts:link', 'payments:initiate', 'invoices:write', 'tax:declare', 'reports:read', 'documents:read'],
+  business_accountant: ['accounts:read', 'invoices:write', 'reports:read', 'documents:read'],
+  business_hr: ['accounts:read', 'payroll:submit', 'documents:read', 'documents:write'],
+  admin_authorizing_officer: ['accounts:read', 'payments:initiate', 'payroll:submit', 'budget:read', 'reports:read', 'documents:read'],
+  admin_public_accountant: ['accounts:read', 'payments:approve', 'budget:read', 'reports:read', 'documents:read'],
+  admin_viewer: ['accounts:read', 'budget:read', 'reports:read', 'documents:read'],
 };
 
 export function permissionsOf(role: Role): readonly Permission[] {

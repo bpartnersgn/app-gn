@@ -78,6 +78,17 @@ export type OrchestratorOutcome =
  */
 export interface PaymentOrchestrator {
   submit(order: PaymentOrder): Promise<OrchestratorOutcome>;
+  /** Conversion entre deux comptes de la même personne (recharge de carte, crypto vers Mobile Money…). */
+  convert(order: ExchangeOrder): Promise<OrchestratorOutcome>;
+}
+
+export interface ExchangeOrder {
+  exchangeId: string;
+  source: LinkedAccount;
+  target: LinkedAccount;
+  debit: Money;
+  credit: Money;
+  label: string;
 }
 
 export class SimulatedOrchestrator implements PaymentOrchestrator {
@@ -116,6 +127,23 @@ export class SimulatedOrchestrator implements PaymentOrchestrator {
         counterparty: order.source.label,
       });
     }
+    return { status: 'completed', reference };
+  }
+
+  async convert(order: ExchangeOrder): Promise<OrchestratorOutcome> {
+    const reference = `sim_${order.exchangeId}`;
+    try {
+      await this.network.reach(order.source.providerId);
+      await this.network.reach(order.target.providerId);
+    } catch {
+      return { status: 'failed', reference, reason: 'rail_unavailable' };
+    }
+    if (toBigInt(this.network.balance(order.source)) < toBigInt(order.debit)) {
+      return { status: 'failed', reference, reason: 'insufficient_funds' };
+    }
+    const occurredAt = this.now().toISOString();
+    this.network.post(order.source, { occurredAt, direction: 'debit', amount: order.debit, label: order.label, counterparty: order.target.label });
+    this.network.post(order.target, { occurredAt, direction: 'credit', amount: order.credit, label: order.label, counterparty: order.source.label });
     return { status: 'completed', reference };
   }
 }
