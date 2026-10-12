@@ -161,46 +161,58 @@ interface Envelope {
   payload: { paymentIntentId?: string; externalReference?: string; reason?: string; status?: string };
 }
 
+/** Événements déjà traités, pour le dédoublonnage sur `eventId` (en mémoire, ou en base : `db/postgres-store.ts`). */
+export interface ProcessedEvents {
+  has(eventId: string): Promise<boolean>;
+  add(eventId: string): Promise<void>;
+}
+
+export class MemoryProcessedEvents implements ProcessedEvents {
+  private readonly seen = new Set<string>();
+  async has(eventId: string) { return this.seen.has(eventId); }
+  async add(eventId: string) {
+    this.seen.add(eventId);
+    if (this.seen.size > 10_000) this.seen.delete(this.seen.values().next().value!);
+  }
+}
+
 /**
  * Reçoit les événements d'ORCHEA et les traduit en issues de paiement App GN.
  * TransactionConfirmed → payé ; TransactionRejected (par le Risk) et TransactionFailed → échoué, avec la raison ;
  * PaymentAttemptUnknown et PaymentAttemptActionRequired laissent le paiement en cours ; un type inconnu est accepté
- * et ignoré. Dédoublonnage sur `eventId` (en mémoire pour l'instant ; persistant avec la base).
+ * et ignoré. Dédoublonnage sur `eventId` ; l'issue elle-même ne s'applique qu'à un paiement encore en cours,
+ * si bien qu'un événement traité deux fois (arrêt entre les deux écritures) reste sans effet.
  */
 export class OrcheaWebhookReceiver {
   private readonly app: AppGn;
   private readonly secrets: readonly string[];
-  private readonly seen = new Set<string>();
+  private readonly seen: ProcessedEvents;
   private readonly now: () => number;
 
-  constructor(app: AppGn, secrets: readonly string[], now: () => number = () => Math.floor(Date.now() / 1000)) {
+  constructor(app: AppGn, secrets: readonly string[], options: { processed?: ProcessedEvents; now?: () => number } = {}) {
     this.app = app;
     this.secrets = secrets;
-    this.now = now;
+    this.seen = options.processed ?? new MemoryProcessedEvents();
+    this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
-  handle(rawBody: string, signature: string | undefined): WebhookHandling {
+  async handle(rawBody: string, signature: string | undefined): Promise<WebhookHandling> {
     if (!verifyOrcheaSignature(this.secrets, signature, rawBody, this.now())) return { status: 401, result: 'invalid_signature' };
     const event = parseEnvelope(rawBody);
     if (!event) return { status: 400, result: 'malformed' };
-    if (this.seen.has(event.eventId)) return { status: 200, result: 'duplicate' };
+    if (await this.seen.has(event.eventId)) return { status: 200, result: 'duplicate' };
 
     const outcome = outcomeOf(event);
     const intentId = event.payload.paymentIntentId;
     if (!outcome || !intentId) {
-      this.remember(event.eventId);
+      await this.seen.add(event.eventId);
       return { status: 200, result: 'ignored' };
     }
-    const payment = this.app.recordOutcome(`${ORCHEA_REFERENCE_PREFIX}${intentId}`, outcome, event.payload.externalReference);
-    this.remember(event.eventId);
+    const payment = await this.app.recordOutcome(`${ORCHEA_REFERENCE_PREFIX}${intentId}`, outcome, event.payload.externalReference);
+    await this.seen.add(event.eventId);
     return payment
       ? { status: 200, result: 'applied', paymentId: payment.id }
       : { status: 200, result: 'unknown_payment' };
-  }
-
-  private remember(eventId: string): void {
-    this.seen.add(eventId);
-    if (this.seen.size > 10_000) this.seen.delete(this.seen.values().next().value!);
   }
 }
 

@@ -1,6 +1,6 @@
 # App GN — architecture cible
 
-Écrit le 12/10/2026 avec le socle (v0.1.0), complété le même jour (v0.2.0 : canaux par profil, hors ligne d'abord, coffre de documents, cartes virtuelles et conversions). Ce document décrit la cible et dit, pour chaque brique, ce que le socle en contient déjà.
+Écrit le 12/10/2026 avec le socle (v0.1.0), complété le même jour (v0.2.0 : canaux par profil, hors ligne d'abord, coffre de documents, cartes virtuelles et conversions ; v0.3.0 : paiements de factures par ORCHEA, connexion par NIN et code SMS, PostgreSQL). Ce document décrit la cible et dit, pour chaque brique, ce que le socle en contient déjà.
 
 ## 1. Ce qu'est App GN
 
@@ -32,10 +32,13 @@ Le cœur commun est un **agrégateur** (lire tous les comptes : banques, Mobile 
      └───────────────┴──────┬────────┴──────┬────────┴───────────────┴───────────────┘
                             │ AccountConnector │ PaymentOrchestrator
               ┌─────────────┴───────┐   ┌──────┴──────────────────┐
-              │ connecteurs simulés │   │ orchestrateur simulé    │
-              │ (cible : API banques,│   │ (cible : ORCHEA, API    │
-              │ Mobile Money, crypto)│   │ payment-intents/payouts)│
+              │ connecteurs simulés │   │ ORCHEA (factures) +     │
+              │ (cible : API banques,│   │ orchestrateur simulé    │
+              │ Mobile Money, crypto)│   │ (le reste)              │
               └─────────────────────┘   └─────────────────────────┘
+                     AppStore (paiements, idempotence, conversions, cartes émises)
+                     ├─ en mémoire (navigateur, démo)
+                     └─ PostgreSQL (apps/api/src/db), ou PGlite sur un poste sans serveur
 ```
 
 Règle de construction : **toute règle d'accès et toute règle métier vivent dans `packages/core`**. L'API et le web ne font que transporter. C'est ce qui permet au web de tourner seul en démo avec exactement les mêmes règles que l'API.
@@ -152,13 +155,32 @@ Dématérialiser les supports : carte d'identité, permis, carte grise, attestat
 ## 11. Ce qui reste simulé ou absent
 
 - Identité : NIN + code SMS et sessions signées (§4), mais SMS non envoyé (code montré en démo) et état en mémoire. Cible : fournisseur SMS, base, identité numérique nationale.
-- Persistance : mémoire. Cible : PostgreSQL, comme ORCHEA.
+- Persistance : PostgreSQL pour l'état transactionnel (§12) ; référentiel encore issu des données de démonstration.
 - Cartes et conversions : émetteur et cours simulés, frais fictifs.
 - Documents : fictifs, aucun émetteur raccordé, pas encore de signature.
 - Connecteurs : tous simulés. Chaque fournisseur réel demande un accord et une API (voir `positionnement/chiffres-a-sourcer.md` pour Ecobank, UBA, Cellcom, Moov).
 - Orchestrateur : simulé par défaut ; ORCHEA pour les factures depuis Orange Money et MTN MoMo quand `ORCHEA_*` est réglé (§6).
 - Piste d'audit, notifications, rattachement d'un compte, bascule citoyen → pro : à construire.
 
-## 12. Stack
+## 12. Données
 
-TypeScript partout, Node ≥ 22.18 (exécution directe des `.ts`), Fastify 5 pour l'API, React 19 + Vite pour le web (application installable), `node:test` pour les tests. Mêmes choix qu'ORCHEA pour que les deux dépôts se lisent de la même façon. Voir `docs/adr/adr-001-socle.md` et `docs/adr/adr-002-canaux-hors-ligne-documents-cartes.md`.
+Le port `AppStore` (`packages/core/src/store.ts`) garde ce qui doit survivre à un redémarrage : paiements, clés d'idempotence, conversions, cartes émises et leur état. Côté serveur, `PostgresStore` (`apps/api/src/db/`) le met en base, avec aussi les défis de connexion, les demandes de code, les sessions révoquées et les webhooks ORCHEA déjà traités.
+
+| Réglage | Base |
+|---|---|
+| `DATABASE_URL=postgres://…` | serveur PostgreSQL (cible en service ; `DATABASE_POOL_SIZE`, 10 par défaut) |
+| `APPGN_PGLITE_DIR=./.data` | PostgreSQL embarqué (PGlite) dans ce dossier, pour un poste sans serveur |
+| rien | mémoire, perdue à l'arrêt |
+
+Le schéma (`db/schema.sql`) s'applique au démarrage et se rejoue sans effet. Les objets sont gardés en JSONB, dans la forme exacte du noyau, avec en colonnes ce qui sert à chercher et à verrouiller. Chaque garantie tient dans une seule instruction SQL, donc plusieurs instances peuvent partager la base :
+- une clé d'idempotence se réserve par `INSERT … ON CONFLICT DO NOTHING` avant tout effet, et se libère si la demande est refusée ;
+- un paiement ne change d'état que s'il est encore dans l'état attendu (`UPDATE … WHERE status = …`) : deux visas simultanés d'un même mandat n'en paient qu'un ;
+- un code de connexion se consomme par `DELETE … RETURNING` : un seul essai simultané l'emporte.
+
+Vérifié le 12/10/2026 sur PGlite et sur PostgreSQL 16 (mêmes tests, `TEST_DATABASE_URL`), et par redémarrage du serveur : session, paiement, rejeu par la même clé, carte émise et révocation retrouvés.
+
+Ce qui reste en mémoire : le référentiel (personnes, espaces, rattachements, comptes liés, documents), qui vient encore des données de démonstration et viendra de l'inscription ; les devis de conversion (60 s) ; les cartes chargées au démarrage, ce qui suppose une seule instance tant que l'émission n'est pas relue en base à chaque demande.
+
+## 13. Stack
+
+TypeScript partout, Node ≥ 22.18 (exécution directe des `.ts`), Fastify 5 pour l'API, React 19 + Vite pour le web (application installable), `node:test` pour les tests. Mêmes choix qu'ORCHEA pour que les deux dépôts se lisent de la même façon. PostgreSQL par `pg`, PGlite pour les tests et les postes sans serveur. Voir les ADR de `docs/adr/`.

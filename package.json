@@ -1,10 +1,16 @@
 {
   "name": "app-gn",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/core", "apps/api", "apps/web"],
-  "engines": { "node": ">=22.18" },
+  "workspaces": [
+    "packages/core",
+    "apps/api",
+    "apps/web"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "dev:api": "npm run dev -w @app-gn/api",
     "dev:web": "npm run dev -w @app-gn/web",

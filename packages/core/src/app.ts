@@ -27,10 +27,12 @@ import {
   type Payment,
   type PaymentDestination,
   type PaymentOrchestrator,
+  type PaymentStatus,
 } from './payments.ts';
 import { PROVIDERS, providerById } from './providers.ts';
 import { can, permissionsOf, ROLE_LABELS, type Permission } from './rbac.ts';
 import { DEMO_FX, seedDemo } from './seed.ts';
+import { MemoryAppStore, type AppStore } from './store.ts';
 import { servicesFor, type ServiceDefinition } from './services.ts';
 
 export interface SpaceAccess {
@@ -68,11 +70,6 @@ export interface CardView extends VirtualCard {
   currency: Currency;
 }
 
-interface IdempotencyRecord {
-  fingerprint: string;
-  resultId: string;
-}
-
 export interface AppGnDependencies {
   persons: Person[];
   spaces: Space[];
@@ -86,6 +83,8 @@ export interface AppGnDependencies {
   fx: FxTable;
   now?: () => Date;
   aggregationTimeoutMs?: number;
+  /** Paiements, idempotence, conversions, cartes émises. En mémoire par défaut. */
+  store?: AppStore;
 }
 
 /**
@@ -96,22 +95,38 @@ export interface AppGnDependencies {
 export class AppGn {
   private readonly deps: AppGnDependencies;
   private readonly aggregator: Aggregator;
-  private readonly payments = new Map<string, Payment>();
+  private readonly store: AppStore;
   private readonly quotes = new Map<string, ExchangeQuote>();
-  private readonly exchanges = new Map<string, Exchange>();
-  private readonly idempotency = new Map<string, IdempotencyRecord>();
   private readonly now: () => Date;
-  private sequence = 0;
 
   constructor(deps: AppGnDependencies) {
     this.deps = deps;
     this.now = deps.now ?? (() => new Date());
+    this.store = deps.store ?? new MemoryAppStore();
     this.aggregator = new Aggregator({
       connectors: deps.connectors,
       fx: deps.fx,
       timeoutMs: deps.aggregationTimeoutMs ?? 3000,
       now: this.now,
     });
+  }
+
+  /**
+   * Reprend l'état gardé par le magasin (cartes émises, cartes bloquées) au démarrage.
+   * Rend les comptes de carte recréés, pour que l'appelant les rouvre chez leur fournisseur.
+   */
+  async load(): Promise<LinkedAccount[]> {
+    const restored: LinkedAccount[] = [];
+    for (const { card, account } of await this.store.issuedCards()) {
+      const index = this.deps.cards.findIndex((candidate) => candidate.accountId === card.accountId);
+      if (index >= 0) this.deps.cards[index] = card;
+      else this.deps.cards.push(card);
+      if (account && !this.deps.accounts.some((candidate) => candidate.id === account.id)) {
+        this.deps.accounts.push(account);
+        restored.push(account);
+      }
+    }
+    return restored;
   }
 
   listPersons(): Person[] {
@@ -189,30 +204,38 @@ export class AppGn {
 
   // ── Paiements ──────────────────────────────────────────────────────────────
 
-  listPayments(actor: Actor, spaceId: string): Payment[] {
+  async listPayments(actor: Actor, spaceId: string): Promise<Payment[]> {
     this.authorize(actor, spaceId, 'accounts:read');
-    return [...this.payments.values()]
-      .filter((payment) => payment.spaceId === spaceId)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    return this.store.paymentsOfSpace(spaceId);
   }
 
   async initiatePayment(actor: Actor, spaceId: string, input: PaymentInput, idempotencyKey: string): Promise<Payment> {
     const { space, role } = this.authorize(actor, spaceId, 'payments:initiate');
-    const replay = this.replay(actor, spaceId, 'payment', idempotencyKey, [input.sourceAccountId, input.amount, input.destination, input.label ?? null]);
-    if (replay) return this.payments.get(replay)!;
+    const id = this.nextId('pay');
+    const claim = this.scope(actor, spaceId, 'payment', idempotencyKey);
+    const replay = await this.claim(claim, [input.sourceAccountId, input.amount, input.destination, input.label ?? null], id);
+    if (replay) return this.replayed(await this.store.payment(replay));
 
-    const source = this.account(spaceId, input.sourceAccountId);
-    const provider = providerById(source.providerId);
-    if (!provider?.canDebit) throw new AppError('invalid_request', 'ce compte ne peut pas être débité depuis App GN');
-    this.assertCardUsable(source);
-    if (!isCurrency(source.currency)) throw new AppError('invalid_request', 'devise inconnue');
-    const amount = typeof input.amount === 'string' ? parseMajor(input.amount, source.currency) : null;
-    if (!amount || BigInt(amount.amount) <= 0n) throw new AppError('invalid_request', `montant invalide pour ${source.currency}`);
-    this.validateDestination(spaceId, source, input.destination);
+    let source: LinkedAccount;
+    let amount: ReturnType<typeof parseMajor>;
+    try {
+      source = this.account(spaceId, input.sourceAccountId);
+      const provider = providerById(source.providerId);
+      if (!provider?.canDebit) throw new AppError('invalid_request', 'ce compte ne peut pas être débité depuis App GN');
+      this.assertCardUsable(source);
+      if (!isCurrency(source.currency)) throw new AppError('invalid_request', 'devise inconnue');
+      amount = typeof input.amount === 'string' ? parseMajor(input.amount, source.currency) : null;
+      if (!amount || BigInt(amount.amount) <= 0n) throw new AppError('invalid_request', `montant invalide pour ${source.currency}`);
+      this.validateDestination(spaceId, source, input.destination);
+    } catch (error) {
+      // Une demande refusée ne garde pas sa clé : corrigée, elle peut repartir sous la même.
+      await this.store.releaseIdempotency(claim);
+      throw error;
+    }
 
     const timestamp = this.now().toISOString();
     const payment: Payment = {
-      id: this.nextId('pay'),
+      id,
       spaceId,
       sourceAccountId: source.id,
       amount,
@@ -224,30 +247,28 @@ export class AppGn {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
-    this.payments.set(payment.id, payment);
-    this.remember(actor, spaceId, 'payment', idempotencyKey, [input.sourceAccountId, input.amount, input.destination, input.label ?? null], payment.id);
-
-    if (payment.approval === 'none') await this.submit(payment);
+    await this.store.insertPayment(payment);
+    if (payment.approval === 'none') return this.submit(payment);
     return payment;
   }
 
   async approvePayment(actor: Actor, spaceId: string, paymentId: string): Promise<Payment> {
     this.authorize(actor, spaceId, 'payments:approve');
-    const payment = this.pendingPayment(spaceId, paymentId);
+    const payment = await this.pendingPayment(spaceId, paymentId);
     if (payment.initiatedBy === actor.personId) {
       throw new AppError('separation_of_duties', 'l’initiateur d’un paiement ne peut pas l’approuver');
     }
     payment.decidedBy = actor.personId;
-    await this.submit(payment);
-    return payment;
+    return this.submit(payment);
   }
 
-  rejectPayment(actor: Actor, spaceId: string, paymentId: string): Payment {
+  async rejectPayment(actor: Actor, spaceId: string, paymentId: string): Promise<Payment> {
     this.authorize(actor, spaceId, 'payments:approve');
-    const payment = this.pendingPayment(spaceId, paymentId);
+    const payment = await this.pendingPayment(spaceId, paymentId);
     payment.decidedBy = actor.personId;
     payment.status = 'rejected';
     payment.updatedAt = this.now().toISOString();
+    if (!await this.store.updatePayment(payment, 'pending_approval')) throw new AppError('invalid_state', 'paiement déjà décidé');
     return payment;
   }
 
@@ -256,11 +277,11 @@ export class AppGn {
    * l'orchestrateur ou, à défaut, par l'identifiant du paiement (sa référence externe chez l'orchestrateur).
    * Seul un paiement en cours change : un événement rejoué ou tardif est sans effet.
    */
-  recordOutcome(reference: string, outcome: OrchestratorOutcome, paymentId?: string): Payment | undefined {
-    const payment = [...this.payments.values()].find((candidate) => candidate.orchestratorReference === reference)
-      ?? (paymentId ? this.payments.get(paymentId) : undefined);
+  async recordOutcome(reference: string, outcome: OrchestratorOutcome, paymentId?: string): Promise<Payment | undefined> {
+    const payment = await this.store.paymentByReference(reference) ?? (paymentId ? await this.store.payment(paymentId) : undefined);
     if (!payment || payment.status !== 'processing') return payment;
     this.applyOutcome(payment, outcome);
+    if (!await this.store.updatePayment(payment, 'processing')) return this.store.payment(payment.id);
     return payment;
   }
 
@@ -278,26 +299,34 @@ export class AppGn {
 
   async issueCard(actor: Actor, spaceId: string, request: { network: CardNetwork; tier: CardTier; currency?: Currency }, idempotencyKey: string): Promise<CardView> {
     this.authorize(actor, spaceId, 'cards:manage');
-    const replay = this.replay(actor, spaceId, 'card', idempotencyKey, [request.network, request.tier, request.currency ?? 'USD']);
-    if (replay) return this.cards(actor, spaceId).find((card) => card.accountId === replay)!;
-    if (!['visa', 'mastercard'].includes(request.network)) throw new AppError('invalid_request', 'réseau de carte inconnu');
-    if (!['standard', 'gold'].includes(request.tier)) throw new AppError('invalid_request', 'type de carte inconnu');
+    const accountId = this.nextId('acc_card');
+    const claim = this.scope(actor, spaceId, 'card', idempotencyKey);
+    const replay = await this.claim(claim, [request.network, request.tier, request.currency ?? 'USD'], accountId);
+    if (replay) return this.replayed(this.cards(actor, spaceId).find((card) => card.accountId === replay));
     const currency = request.currency ?? 'USD';
-    if (currency !== 'USD' && currency !== 'GNF') throw new AppError('invalid_request', 'une carte est en USD ou en GNF');
-    const sameTier = this.deps.cards.filter((card) => card.spaceId === spaceId && card.tier === request.tier).length;
-    if (sameTier >= MAX_CARDS_PER_TIER) throw new AppError('invalid_state', `au plus ${MAX_CARDS_PER_TIER} cartes de ce type`);
-    this.sequence += 1;
-    const { account, card } = await this.deps.cardIssuer.issue({
-      spaceId,
-      network: request.network,
-      tier: request.tier,
-      holderName: this.person(actor.personId).fullName,
-      currency,
-      sequence: this.sequence,
-    });
+    let issued: { account: LinkedAccount; card: VirtualCard };
+    try {
+      if (!['visa', 'mastercard'].includes(request.network)) throw new AppError('invalid_request', 'réseau de carte inconnu');
+      if (!['standard', 'gold'].includes(request.tier)) throw new AppError('invalid_request', 'type de carte inconnu');
+      if (currency !== 'USD' && currency !== 'GNF') throw new AppError('invalid_request', 'une carte est en USD ou en GNF');
+      const sameTier = this.deps.cards.filter((card) => card.spaceId === spaceId && card.tier === request.tier).length;
+      if (sameTier >= MAX_CARDS_PER_TIER) throw new AppError('invalid_state', `au plus ${MAX_CARDS_PER_TIER} cartes de ce type`);
+      issued = await this.deps.cardIssuer.issue({
+        accountId,
+        spaceId,
+        network: request.network,
+        tier: request.tier,
+        holderName: this.person(actor.personId).fullName,
+        currency,
+      });
+    } catch (error) {
+      await this.store.releaseIdempotency(claim);
+      throw error;
+    }
+    const { account, card } = issued;
+    await this.store.saveCard(card, account);
     this.deps.accounts.push(account);
     this.deps.cards.push(card);
-    this.remember(actor, spaceId, 'card', idempotencyKey, [request.network, request.tier, request.currency ?? 'USD'], account.id);
     return { ...card, label: account.label, currency };
   }
 
@@ -307,6 +336,7 @@ export class AppGn {
     if (!card) throw new AppError('not_found', 'carte introuvable');
     await this.deps.cardIssuer.setFrozen(card, frozen);
     card.status = frozen ? 'frozen' : 'active';
+    await this.store.saveCard(card);
     return this.cards(actor, spaceId).find((candidate) => candidate.accountId === accountId)!;
   }
 
@@ -350,17 +380,26 @@ export class AppGn {
 
   async executeExchange(actor: Actor, spaceId: string, quoteId: string, idempotencyKey: string): Promise<Exchange> {
     this.authorize(actor, spaceId, 'payments:initiate');
-    const replay = this.replay(actor, spaceId, 'exchange', idempotencyKey, [quoteId]);
-    if (replay) return this.exchanges.get(replay)!;
+    const id = this.nextId('xch');
+    const claim = this.scope(actor, spaceId, 'exchange', idempotencyKey);
+    const replay = await this.claim(claim, [quoteId], id);
+    if (replay) return this.replayed(await this.store.exchange(replay));
     const quote = this.quotes.get(quoteId);
-    if (!quote || quote.spaceId !== spaceId || quote.personId !== actor.personId) throw new AppError('not_found', 'devis introuvable');
-    if (Date.parse(quote.expiresAt) <= this.now().getTime()) throw new AppError('invalid_state', 'devis expiré : demandez-en un nouveau');
-    const source = this.account(spaceId, quote.sourceAccountId);
-    const target = this.account(spaceId, quote.targetAccountId);
-    this.assertCardUsable(source);
+    let source: LinkedAccount;
+    let target: LinkedAccount;
+    try {
+      if (!quote || quote.spaceId !== spaceId || quote.personId !== actor.personId) throw new AppError('not_found', 'devis introuvable');
+      if (Date.parse(quote.expiresAt) <= this.now().getTime()) throw new AppError('invalid_state', 'devis expiré : demandez-en un nouveau');
+      source = this.account(spaceId, quote.sourceAccountId);
+      target = this.account(spaceId, quote.targetAccountId);
+      this.assertCardUsable(source);
+    } catch (error) {
+      await this.store.releaseIdempotency(claim);
+      throw error;
+    }
     this.quotes.delete(quoteId);
     const exchange: Exchange = {
-      id: this.nextId('xch'),
+      id,
       quoteId,
       spaceId,
       sourceAccountId: source.id,
@@ -381,8 +420,7 @@ export class AppGn {
     });
     exchange.status = outcome.status === 'failed' ? 'failed' : 'completed';
     if (outcome.status === 'failed') exchange.failureReason = outcome.reason;
-    this.exchanges.set(exchange.id, exchange);
-    this.remember(actor, spaceId, 'exchange', idempotencyKey, [quoteId], exchange.id);
+    await this.store.saveExchange(exchange);
     return exchange;
   }
 
@@ -392,16 +430,24 @@ export class AppGn {
 
   // ── Interne ────────────────────────────────────────────────────────────────
 
-  private replay(actor: Actor, spaceId: string, kind: string, key: string, request: unknown): string | undefined {
+  private scope(actor: Actor, spaceId: string, kind: string, key: string): string {
     if (!key || key.length > 255) throw new AppError('invalid_request', 'Idempotency-Key requise (1 à 255 caractères)');
-    const record = this.idempotency.get(`${kind}:${spaceId}:${actor.personId}:${key}`);
-    if (!record) return undefined;
-    if (record.fingerprint !== JSON.stringify(request)) throw new AppError('idempotency_conflict', 'cette clé d’idempotence a déjà servi pour une autre demande');
-    return record.resultId;
+    return `${kind}:${spaceId}:${actor.personId}:${key}`;
   }
 
-  private remember(actor: Actor, spaceId: string, kind: string, key: string, request: unknown, resultId: string): void {
-    this.idempotency.set(`${kind}:${spaceId}:${actor.personId}:${key}`, { fingerprint: JSON.stringify(request), resultId });
+  /** Réserve la clé pour `resultId`, ou rend le résultat d'une demande identique déjà reçue. */
+  private async claim(scope: string, request: unknown, resultId: string): Promise<string | undefined> {
+    const fingerprint = JSON.stringify(request);
+    const existing = await this.store.claimIdempotency(scope, { fingerprint, resultId });
+    if (!existing) return undefined;
+    if (existing.fingerprint !== fingerprint) throw new AppError('idempotency_conflict', 'cette clé d’idempotence a déjà servi pour une autre demande');
+    return existing.resultId;
+  }
+
+  /** Une clé réservée dont le résultat n'est pas encore écrit : la demande identique est encore en cours. */
+  private replayed<T>(result: T | undefined): T {
+    if (!result) throw new AppError('idempotency_conflict', 'une demande identique est en cours : réessayez dans un instant');
+    return result;
   }
 
   private nextId(prefix: string): string {
@@ -415,9 +461,12 @@ export class AppGn {
     if (card?.status === 'frozen') throw new AppError('invalid_state', 'carte bloquée : débloquez-la pour l’utiliser');
   }
 
-  private async submit(payment: Payment): Promise<void> {
+  /** Passe le paiement en cours (une seule fois, même sous décisions concurrentes), le remet à l'orchestrateur, garde l'issue. */
+  private async submit(payment: Payment): Promise<Payment> {
+    const from: PaymentStatus = payment.status;
     payment.status = 'processing';
     payment.updatedAt = this.now().toISOString();
+    if (!await this.store.updatePayment(payment, from)) throw new AppError('invalid_state', 'paiement déjà décidé');
     const source = this.account(payment.spaceId, payment.sourceAccountId);
     const destinationAccount = payment.destination.type === 'own_account'
       ? this.account(payment.spaceId, payment.destination.accountId)
@@ -431,6 +480,9 @@ export class AppGn {
       label: payment.label,
     });
     this.applyOutcome(payment, outcome);
+    // L'issue a pu arriver avant la réponse (webhook rapide) : on garde alors ce qui est enregistré.
+    if (!await this.store.updatePayment(payment, 'processing')) return (await this.store.payment(payment.id))!;
+    return payment;
   }
 
   private applyOutcome(payment: Payment, outcome: OrchestratorOutcome): void {
@@ -466,8 +518,8 @@ export class AppGn {
     }
   }
 
-  private pendingPayment(spaceId: string, paymentId: string): Payment {
-    const payment = this.payments.get(paymentId);
+  private async pendingPayment(spaceId: string, paymentId: string): Promise<Payment> {
+    const payment = await this.store.payment(paymentId);
     if (!payment || payment.spaceId !== spaceId) throw new AppError('not_found', 'paiement introuvable');
     if (payment.status !== 'pending_approval') throw new AppError('invalid_state', `paiement déjà ${payment.status}`);
     return payment;
@@ -529,6 +581,7 @@ export interface DemoOptions {
   aggregationTimeoutMs?: number;
   /** Remplace l'orchestrateur simulé (par ORCHEA, côté serveur), construit sur le même réseau simulé. */
   orchestrator?: (network: SimulatedNetwork, now: () => Date) => PaymentOrchestrator;
+  store?: AppStore;
 }
 
 /** Monte une instance complète sur données fictives : réseau simulé, un connecteur simulé par fournisseur. */
@@ -548,6 +601,14 @@ export function createDemoApp(options: DemoOptions = {}): { app: AppGn; network:
     fx: DEMO_FX,
     now,
     aggregationTimeoutMs: options.aggregationTimeoutMs,
+    store: options.store,
   });
   return { app, network };
+}
+
+/** Comme `createDemoApp`, puis reprend l'état du magasin (cartes émises) et rouvre leurs comptes sur le réseau simulé. */
+export async function loadDemoApp(options: DemoOptions = {}): Promise<{ app: AppGn; network: SimulatedNetwork }> {
+  const demo = createDemoApp(options);
+  for (const account of await demo.app.load()) demo.network.open(account, []);
+  return demo;
 }

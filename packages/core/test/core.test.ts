@@ -114,7 +114,7 @@ describe('paiements', () => {
     const first = await app.initiatePayment(A('per_mariama'), 'spc_cit_mariama', input, 'same');
     const second = await app.initiatePayment(A('per_mariama'), 'spc_cit_mariama', input, 'same');
     assert.equal(first.id, second.id);
-    assert.equal(app.listPayments(A('per_mariama'), 'spc_cit_mariama').length, 1);
+    assert.equal((await app.listPayments(A('per_mariama'), 'spc_cit_mariama')).length, 1);
     await rejects(app.initiatePayment(A('per_mariama'), 'spc_cit_mariama', { ...input, amount: '2000' }, 'same'), 'idempotency_conflict');
   });
 
@@ -306,6 +306,6 @@ describe('hors ligne', () => {
       const payment = await app.initiatePayment(me, pending.spaceId, pending.payload as typeof input, pending.id);
       return { outcome: 'sent', detail: payment.id };
     }, fixedNow());
-    assert.equal(app.listPayments(me, 'spc_cit_mariama').length, 1);
+    assert.equal((await app.listPayments(me, 'spc_cit_mariama')).length, 1);
   });
 });

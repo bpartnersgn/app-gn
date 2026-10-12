@@ -33,7 +33,7 @@ export const MAX_CARDS_PER_TIER = 3;
 export const CARD_ISSUE_PRICE_GNF: Record<CardTier, number> = { standard: 25_000, gold: 120_000 };
 
 export interface CardIssuer {
-  issue(request: { spaceId: string; network: CardNetwork; tier: CardTier; holderName: string; currency: Currency; sequence: number }): Promise<{ account: LinkedAccount; card: VirtualCard }>;
+  issue(request: { accountId: string; spaceId: string; network: CardNetwork; tier: CardTier; holderName: string; currency: Currency }): Promise<{ account: LinkedAccount; card: VirtualCard }>;
   setFrozen(card: VirtualCard, frozen: boolean): Promise<void>;
 }
 
@@ -46,13 +46,14 @@ export class SimulatedCardIssuer implements CardIssuer {
     this.now = now;
   }
 
-  async issue(request: { spaceId: string; network: CardNetwork; tier: CardTier; holderName: string; currency: Currency; sequence: number }) {
+  async issue(request: { accountId: string; spaceId: string; network: CardNetwork; tier: CardTier; holderName: string; currency: Currency }) {
     await this.network.reach('appgn_card');
-    const last4 = String(4000 + ((request.sequence * 7919) % 6000)).slice(-4);
+    const digits = [...request.accountId].reduce((sum, char, index) => (sum + char.charCodeAt(0) * (index + 7919)) % 6000, 0);
+    const last4 = String(4000 + digits).slice(-4);
     const now = this.now();
     const expiry = `${String(now.getUTCMonth() + 1).padStart(2, '0')}/${String((now.getUTCFullYear() + 3) % 100).padStart(2, '0')}`;
     const account: LinkedAccount = {
-      id: `acc_card_${request.sequence.toString().padStart(4, '0')}`,
+      id: request.accountId,
       spaceId: request.spaceId,
       providerId: 'appgn_card',
       label: `Carte ${request.network === 'visa' ? 'Visa' : 'Mastercard'} ${CARD_TIER_LABELS[request.tier]}`,

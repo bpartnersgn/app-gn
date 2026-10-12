@@ -34,6 +34,14 @@ npm run dev:api
 VITE_API_URL=/ npm run dev:web
 ```
 
+Avec une base (sinon tout est en mémoire et perdu à l'arrêt) :
+
+```bash
+APPGN_PGLITE_DIR=./.data npm run dev:api                       # PostgreSQL embarqué, sans serveur à installer
+DATABASE_URL=postgres://appgn:appgn@localhost:5432/appgn npm run dev:api   # serveur PostgreSQL
+TEST_DATABASE_URL=postgres://… node --test apps/api/test/postgres.test.ts  # tests du magasin contre un vrai serveur (base jetable)
+```
+
 Avec ORCHEA (simulateur local, depuis le dépôt d'ORCHEA) :
 
 ```bash
@@ -72,6 +80,6 @@ Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeI
 
 ## Structure
 - `packages/core` — règles : profils et droits, agrégation, paiements, catalogue, montants
-- `apps/api` — API HTTP (Fastify)
+- `apps/api` — API HTTP (Fastify), connexion (`auth.ts`), adaptateur ORCHEA (`orchea.ts`), base (`db/`)
 - `apps/web` — interface (React + Vite)
 - `docs/` — architecture et décisions

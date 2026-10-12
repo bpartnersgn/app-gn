@@ -6,6 +6,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: appgn
+          POSTGRES_PASSWORD: appgn
+          POSTGRES_DB: appgn_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U appgn" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -15,4 +25,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # Le magasin PostgreSQL contre un vrai serveur (le reste de la suite l'exerce sur PGlite).
+      - run: node --test apps/api/test/postgres.test.ts
+        env:
+          TEST_DATABASE_URL: postgres://appgn:appgn@localhost:5432/appgn_test
       - run: npm run build:web

@@ -11,11 +11,11 @@ import { AppError, isChannel, type Actor, type AppGn, type CardNetwork, type Car
  * Le format d'appareil est déclaré par le client (`AppGN-Channel: phone | tablet | desktop`, `phone` par défaut,
  * le plus restrictif). C'est une règle produit, pas une frontière de sécurité : la cible le liera à l'appareil enregistré.
  */
-function resolveActor(request: FastifyRequest, auth: Auth | undefined, allowDemo: boolean): Actor {
+async function resolveActor(request: FastifyRequest, auth: Auth | undefined, allowDemo: boolean): Promise<Actor> {
   const header = request.headers.authorization ?? '';
   const bearer = /^Bearer (\S+)$/.exec(header)?.[1];
   const demo = allowDemo ? /^demo:([\w-]+)$/.exec(bearer ?? '')?.[1] : undefined;
-  const personId = demo ?? (bearer && auth ? auth.read(bearer)?.personId : undefined);
+  const personId = demo ?? (bearer && auth ? (await auth.read(bearer))?.personId : undefined);
   if (!personId) throw new AppError('unauthenticated', 'session absente ou expirée : connectez-vous');
   const channel = request.headers['appgn-channel'] ?? 'phone';
   if (!isChannel(channel)) throw new AppError('invalid_request', 'AppGN-Channel : phone, tablet ou desktop');
@@ -62,7 +62,7 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
       scope.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => done(null, body));
       scope.post('/v1/webhooks/orchea', async (request, reply) => {
         const signature = request.headers['x-orchea-signature'];
-        const handled = orcheaWebhooks.handle(typeof request.body === 'string' ? request.body : '', typeof signature === 'string' ? signature : undefined);
+        const handled = await orcheaWebhooks.handle(typeof request.body === 'string' ? request.body : '', typeof signature === 'string' ? signature : undefined);
         if (handled.status === 200) request.log.info({ result: handled.result, paymentId: handled.paymentId }, 'webhook ORCHEA');
         return reply.status(handled.status).send({ result: handled.result });
       });
@@ -75,70 +75,70 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
     server.post<{ Body: { nin?: unknown } }>('/v1/auth/codes', async (request, reply) =>
       reply.status(202).send(await auth.requestCode(request.body?.nin)));
     server.post<{ Body: { challengeId?: unknown; code?: unknown } }>('/v1/auth/sessions', async (request, reply) => {
-      const { token, session } = auth.verifyCode(request.body?.challengeId, request.body?.code);
+      const { token, session } = await auth.verifyCode(request.body?.challengeId, request.body?.code);
       return reply.status(201).send({ token, expiresAt: session.expiresAt, me: app.me({ personId: session.personId, channel: 'phone' }) });
     });
     server.delete('/v1/auth/sessions/current', async (request, reply) => {
       const bearer = /^Bearer (\S+)$/.exec(request.headers.authorization ?? '')?.[1];
-      const session = bearer ? auth.read(bearer) : undefined;
-      if (session) auth.revoke(session);
+      const session = bearer ? await auth.read(bearer) : undefined;
+      if (session) await auth.revoke(session);
       return reply.status(204).send();
     });
   }
   server.get('/v1/catalog', async () => app.catalog());
 
-  server.get('/v1/me', async (request) => app.me(actorOf(request)));
+  server.get('/v1/me', async (request) => app.me(await actorOf(request)));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/overview', async (request) =>
-    app.overview(actorOf(request), request.params.spaceId));
+    app.overview(await actorOf(request), request.params.spaceId));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/services', async (request) =>
-    app.services(actorOf(request), request.params.spaceId));
+    app.services(await actorOf(request), request.params.spaceId));
 
   server.get<{ Params: { spaceId: string; accountId: string }; Querystring: { limit?: string } }>(
     '/v1/spaces/:spaceId/accounts/:accountId/transactions',
-    async (request) => app.transactions(actorOf(request), request.params.spaceId, request.params.accountId, Number(request.query.limit ?? 20) || 20),
+    async (request) => app.transactions(await actorOf(request), request.params.spaceId, request.params.accountId, Number(request.query.limit ?? 20) || 20),
   );
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/payments', async (request) =>
-    app.listPayments(actorOf(request), request.params.spaceId));
+    app.listPayments(await actorOf(request), request.params.spaceId));
 
   server.post<{ Params: { spaceId: string }; Body: PaymentInput }>('/v1/spaces/:spaceId/payments', async (request, reply) => {
-    const payment = await app.initiatePayment(actorOf(request), request.params.spaceId, request.body ?? ({} as PaymentInput), keyOf(request));
+    const payment = await app.initiatePayment(await actorOf(request), request.params.spaceId, request.body ?? ({} as PaymentInput), keyOf(request));
     return reply.status(201).send(payment);
   });
 
   server.post<{ Params: { spaceId: string; paymentId: string } }>('/v1/spaces/:spaceId/payments/:paymentId/approve', async (request) =>
-    app.approvePayment(actorOf(request), request.params.spaceId, request.params.paymentId));
+    app.approvePayment(await actorOf(request), request.params.spaceId, request.params.paymentId));
 
   server.post<{ Params: { spaceId: string; paymentId: string } }>('/v1/spaces/:spaceId/payments/:paymentId/reject', async (request) =>
-    app.rejectPayment(actorOf(request), request.params.spaceId, request.params.paymentId));
+    app.rejectPayment(await actorOf(request), request.params.spaceId, request.params.paymentId));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/documents', async (request) =>
-    app.documents(actorOf(request), request.params.spaceId));
+    app.documents(await actorOf(request), request.params.spaceId));
 
   // Public : ce qu'un contrôleur voit en saisissant le code d'un document.
   server.get<{ Params: { code: string } }>('/v1/document-checks/:code', async (request) => app.verifyDocument(request.params.code));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/cards', async (request) =>
-    app.cards(actorOf(request), request.params.spaceId));
+    app.cards(await actorOf(request), request.params.spaceId));
 
   server.post<{ Params: { spaceId: string }; Body: { network: CardNetwork; tier: CardTier; currency?: Currency } }>('/v1/spaces/:spaceId/cards', async (request, reply) => {
-    const card = await app.issueCard(actorOf(request), request.params.spaceId, request.body ?? ({} as never), keyOf(request));
+    const card = await app.issueCard(await actorOf(request), request.params.spaceId, request.body ?? ({} as never), keyOf(request));
     return reply.status(201).send(card);
   });
 
   server.post<{ Params: { spaceId: string; accountId: string } }>('/v1/spaces/:spaceId/cards/:accountId/freeze', async (request) =>
-    app.setCardFrozen(actorOf(request), request.params.spaceId, request.params.accountId, true));
+    app.setCardFrozen(await actorOf(request), request.params.spaceId, request.params.accountId, true));
 
   server.post<{ Params: { spaceId: string; accountId: string } }>('/v1/spaces/:spaceId/cards/:accountId/unfreeze', async (request) =>
-    app.setCardFrozen(actorOf(request), request.params.spaceId, request.params.accountId, false));
+    app.setCardFrozen(await actorOf(request), request.params.spaceId, request.params.accountId, false));
 
   server.post<{ Params: { spaceId: string }; Body: ExchangeInput }>('/v1/spaces/:spaceId/exchange-quotes', async (request, reply) =>
-    reply.status(201).send(app.quoteExchange(actorOf(request), request.params.spaceId, request.body ?? ({} as ExchangeInput))));
+    reply.status(201).send(app.quoteExchange(await actorOf(request), request.params.spaceId, request.body ?? ({} as ExchangeInput))));
 
   server.post<{ Params: { spaceId: string }; Body: { quoteId: string } }>('/v1/spaces/:spaceId/exchanges', async (request, reply) => {
-    const exchange = await app.executeExchange(actorOf(request), request.params.spaceId, request.body?.quoteId ?? '', keyOf(request));
+    const exchange = await app.executeExchange(await actorOf(request), request.params.spaceId, request.body?.quoteId ?? '', keyOf(request));
     return reply.status(201).send(exchange);
   });
 

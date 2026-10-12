@@ -12,4 +12,5 @@ export * from './channels.ts';
 export * from './documents.ts';
 export * from './cards.ts';
 export * from './sync.ts';
+export * from './store.ts';
 export * from './app.ts';
