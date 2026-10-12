@@ -82,14 +82,23 @@ Matrice complète : `packages/core/src/rbac.ts`. Un espace dont on n'est pas mem
 
 App GN ne déplace pas d'argent lui-même : il décide (droits, approbation, idempotence) puis remet l'ordre à l'orchestrateur par le port `PaymentOrchestrator`.
 
-| App GN | ORCHEA (cible) |
+| App GN | ORCHEA |
 |---|---|
-| paiement d'une facture, envoi Mobile Money | `POST /v1/payment-intents` ou `POST /v1/payouts` |
-| clé d'idempotence = id du paiement App GN | en-tête `Idempotency-Key` |
-| statut `processing` puis issue | accusé `CREATED` puis webhook signé, lu par `readWebhook` du SDK |
-| `AppGn.recordOutcome(reference, issue)` | réception du webhook |
+| facture payée depuis Orange Money ou MTN MoMo | `POST /v1/payment-intents` avec `payer {msisdn, operator}` : le débit est poussé sur le téléphone |
+| clé d'idempotence `appgn-<id du paiement>` | en-tête `Idempotency-Key` |
+| id du paiement App GN | `externalReference`, rendu dans chaque webhook |
+| facturier (`edg`, `seg`…) | `paymentDestinationId`, réglé par `ORCHEA_BILLER_DESTINATIONS` |
+| statut `processing` | accusé `201 CREATED` (jamais un résultat) |
+| `completed` / `failed` | webhook `TransactionConfirmed` / `TransactionRejected`, `TransactionFailed` |
+| reste `processing` | `PaymentAttemptUnknown`, `PaymentAttemptActionRequired` |
 
-Le socle branche un orchestrateur simulé qui débite et crédite le réseau simulé tout de suite. L'adaptateur ORCHEA réel est le prochain lot côté paiements ; ORCHEA lui-même n'appelle encore aucun Provider réel.
+L'adaptateur vit côté serveur (`apps/api/src/orchea.ts`) : la clé d'API et les numéros complets des wallets ne quittent jamais le serveur, et le noyau reste exécutable dans le navigateur. Sans variables `ORCHEA_*`, tout est simulé ; avec, les factures payées depuis Orange Money ou MTN MoMo passent par ORCHEA, et le reste par l'orchestrateur simulé (repli), jusqu'à ce que les routes correspondantes soient branchées : envoi vers un numéro (payouts, qui demandent un bénéficiaire et des fonds chez ORCHEA), virements entre comptes, conversions, Cellcom et Moov (qu'ORCHEA ne couvre pas encore).
+
+Réception des webhooks (`POST /v1/webhooks/orchea`) : signature `X-Orchea-Signature` vérifiée sur le corps brut (HMAC-SHA256 de `t.corps`, 300 s de tolérance, plusieurs secrets pendant une rotation), dédoublonnage sur `eventId`, puis `AppGn.recordOutcome`, qui retrouve le paiement par la référence ORCHEA ou, si l'appel de création est resté sans réponse, par la référence externe. Un événement rejoué ou tardif est sans effet. Répondre `401` à une signature fausse, `400` à un corps illisible, `200` à tout le reste (y compris un type inconnu).
+
+Si ORCHEA ne répond pas à la création (réseau, `5xx`, `409 payment_in_progress`), le paiement reste en cours : on ne sait pas s'il a été reçu, et le webhook le soldera. Un `4xx` le fait échouer tout de suite (`orchea_<code>`).
+
+Vérifié de bout en bout le 12/10/2026 contre le simulateur local d'ORCHEA (`npm run dev` de son dépôt, mode `mobile-money`) : intention créée, webhook signé reçu, paiement passé à « Exécuté » dans l'interface. Ce qui manque : le rattrapage par le flux `GET /v1/events` quand un webhook se perd, le dédoublonnage persistant (avec la base), l'indication « confirmez sur votre téléphone » portée par `PaymentAttemptActionRequired`, et le solde du wallet, qui reste celui du connecteur simulé.
 
 Les comptes crypto ne servent pas à payer directement : ils se convertissent (§8). L'achat de crypto n'est pas ouvert tant qu'aucun cadre (BCRG, dépositaire) n'est posé.
 
@@ -140,7 +149,7 @@ Dématérialiser les supports : carte d'identité, permis, carte grise, attestat
 - Cartes et conversions : émetteur et cours simulés, frais fictifs.
 - Documents : fictifs, aucun émetteur raccordé, pas encore de signature.
 - Connecteurs : tous simulés. Chaque fournisseur réel demande un accord et une API (voir `positionnement/chiffres-a-sourcer.md` pour Ecobank, UBA, Cellcom, Moov).
-- Orchestrateur : simulé. Cible : ORCHEA par son SDK.
+- Orchestrateur : simulé par défaut ; ORCHEA pour les factures depuis Orange Money et MTN MoMo quand `ORCHEA_*` est réglé (§6).
 - Piste d'audit, notifications, rattachement d'un compte, bascule citoyen → pro : à construire.
 
 ## 12. Stack

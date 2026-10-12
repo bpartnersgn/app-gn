@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import {
   ACCOUNT_KIND_LABELS,
   BILLERS,
@@ -21,7 +21,7 @@ import {
 import { CardsSection } from './Cards.tsx';
 import { useOfflineStatus, useRead, useSession } from './context.ts';
 import { DocumentsSection } from './Documents.tsx';
-import { FAILURE_REASONS, PAYMENT_STATUS, SPACE_KIND_LABELS, dateTime, fmt, shortDate } from './format.ts';
+import { PAYMENT_STATUS, failureLabel, SPACE_KIND_LABELS, dateTime, fmt, shortDate } from './format.ts';
 
 export type Section = 'home' | 'pay' | 'cards' | 'documents' | 'services';
 
@@ -258,7 +258,15 @@ function PaySection({ access, positions, version, onChange }: { access: SpaceAcc
   const { client, actor } = useSession();
   const status = useOfflineStatus(client);
   const spaceId = access.space.id;
-  const payments = useRead<Payment[]>(`${spaceId}:payments`, ({ client: c, actor: a }) => c.base.payments(a, spaceId), version);
+  const [tick, setTick] = useState(0);
+  const payments = useRead<Payment[]>(`${spaceId}:payments`, ({ client: c, actor: a }) => c.base.payments(a, spaceId), version + tick);
+  // Avec l'orchestrateur réel, un paiement reste « en cours » jusqu'au webhook : on relit tant qu'il y en a un.
+  const anyProcessing = (payments.data ?? []).some((payment) => payment.status === 'processing');
+  useEffect(() => {
+    if (!anyProcessing || !status.online || status.simulatedOffline) return;
+    const timer = setInterval(() => setTick((value) => value + 1), 3_000);
+    return () => clearInterval(timer);
+  }, [anyProcessing, status.online, status.simulatedOffline]);
   const [message, setMessage] = useState<Message | null>(null);
   const accountsById = useMemo(() => new Map(positions.map((position) => [position.account.id, position.account])), [positions]);
   const canInitiate = access.permissions.includes('payments:initiate');
@@ -270,7 +278,7 @@ function PaySection({ access, positions, version, onChange }: { access: SpaceAcc
       const result = await client.write(() => approve
         ? client.base.approve(actor, spaceId, payment.id)
         : client.base.reject(actor, spaceId, payment.id));
-      setMessage({ tone: result.status === 'completed' ? 'ok' : 'bad', text: `${result.label} : ${PAYMENT_STATUS[result.status].label.toLowerCase()}.` });
+      setMessage({ tone: result.status === 'completed' ? 'ok' : result.status === 'processing' ? 'wait' : 'bad', text: `${result.label} : ${PAYMENT_STATUS[result.status].label.toLowerCase()}.` });
     } catch (cause) {
       setMessage({ tone: 'bad', text: (cause as Error).message });
     }
@@ -325,7 +333,7 @@ function PaySection({ access, positions, version, onChange }: { access: SpaceAcc
                     </div>
                     <div className="payment-line payment-meta">
                       <span>{accountsById.get(payment.sourceAccountId)?.label ?? payment.sourceAccountId} → {describeDestination(payment.destination)}</span>
-                      <span className={`pill pill-${state.tone}`}>{state.label}{payment.failureReason ? ` · ${FAILURE_REASONS[payment.failureReason] ?? payment.failureReason}` : ''}</span>
+                      <span className={`pill pill-${state.tone}`}>{state.label}{payment.failureReason ? ` · ${failureLabel(payment.failureReason)}` : ''}</span>
                     </div>
                     {mayDecide && (
                       <div className="payment-actions">
@@ -395,10 +403,12 @@ function PaymentForm({ access, positions, onDone }: { access: SpaceAccess; posit
       const payment = result.payment;
       const state = PAYMENT_STATUS[payment.status];
       onDone({
-        tone: state.tone === 'ok' ? 'ok' : state.tone === 'wait' ? 'wait' : 'bad',
+        tone: state.tone === 'ok' ? 'ok' : state.tone === 'wait' || payment.status === 'processing' ? 'wait' : 'bad',
         text: payment.status === 'pending_approval'
           ? `${fmt(payment.amount)} : en attente d’approbation.`
-          : `${fmt(payment.amount)} : ${state.label.toLowerCase()}${payment.failureReason ? ` (${FAILURE_REASONS[payment.failureReason] ?? payment.failureReason})` : ''}.`,
+          : payment.status === 'processing'
+            ? `${fmt(payment.amount)} : en cours. Si votre opérateur le demande, confirmez sur votre téléphone ; le statut se met à jour seul.`
+            : `${fmt(payment.amount)} : ${state.label.toLowerCase()}${payment.failureReason ? ` (${failureLabel(payment.failureReason)})` : ''}.`,
       });
       if (payment.status !== 'failed') setAmount('');
     } catch (cause) {

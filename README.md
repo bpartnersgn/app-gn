@@ -34,6 +34,22 @@ npm run dev:api
 VITE_API_URL=/ npm run dev:web
 ```
 
+Avec ORCHEA (simulateur local, depuis le dépôt d'ORCHEA) :
+
+```bash
+# Dans le dépôt ORCHEA
+ORCHEA_API_KEY=cle_locale_de_demo_123456 ORCHEA_SIMULATOR_MODE=mobile-money \
+ORCHEA_WEBHOOK_URL=http://127.0.0.1:3100/v1/webhooks/orchea ORCHEA_WEBHOOK_SECRET=secret_local_de_demo_0123 \
+ORCHEA_WEBHOOK_ORGANIZATION_ID=org-local npm run dev
+
+# Ici
+ORCHEA_BASE_URL=http://127.0.0.1:3000 ORCHEA_API_KEY=cle_locale_de_demo_123456 \
+ORCHEA_WEBHOOK_SECRET=secret_local_de_demo_0123 ORCHEA_BILLER_DESTINATIONS=edg=dest-edg,seg=dest-seg \
+npm run dev:api
+```
+
+Contre un ORCHEA partagé, ajouter `ORCHEA_MODE=test` avec une clé de test : rien ne bouge. Détails : `docs/architecture.md` §6.
+
 Utilisateurs de démo : Mariama Camara (citoyenne, dirigeante de Couture Mariama), Alpha Diallo (directeur financier de Boké Logistique), Sékou Condé (dirigeant de Boké Logistique), Fatoumata Bah (ordonnatrice, Commune de Kaloum), Ibrahima Sylla (comptable public, Commune de Kaloum).
 
 ## API (v1)
@@ -52,6 +68,7 @@ Authentification de démo : `Authorization: Bearer demo:<personId>`. Format d'ap
 | GET/POST | `/v1/spaces/:spaceId/cards` | lister / émettre une carte virtuelle |
 | POST | `/v1/spaces/:spaceId/cards/:accountId/freeze` · `/unfreeze` | bloquer / débloquer |
 | POST | `/v1/spaces/:spaceId/exchange-quotes` puis `/exchanges` | devis puis conversion |
+| POST | `/v1/webhooks/orchea` | issues de paiement envoyées par ORCHEA (signées ; seulement si `ORCHEA_*` est réglé) |
 
 ## Structure
 - `packages/core` — règles : profils et droits, agrégation, paiements, catalogue, montants

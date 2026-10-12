@@ -47,6 +47,15 @@ export function parseMajor(input: string, currency: Currency): Money | null {
   return money(BigInt(match[1] + fraction.padEnd(decimals, '0')), currency);
 }
 
+/** Montant en unités majeures, en chaîne décimale exacte (« 12500 », « 10.50 »), l'inverse de `parseMajor`. */
+export function toMajor(value: Money): string {
+  const decimals = CURRENCIES[value.currency].decimals;
+  const amount = toBigInt(value);
+  const sign = amount < 0n ? '-' : '';
+  const digits = (amount < 0n ? -amount : amount).toString().padStart(decimals + 1, '0');
+  return decimals === 0 ? `${sign}${digits}` : `${sign}${digits.slice(0, -decimals)}.${digits.slice(-decimals)}`;
+}
+
 /** Taux indicatif : nombre d'unités mineures de GNF pour une unité majeure de la devise. */
 export type FxTable = Partial<Record<Currency, bigint>>;
 

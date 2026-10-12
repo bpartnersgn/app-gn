@@ -245,9 +245,14 @@ export class AppGn {
     return payment;
   }
 
-  /** Point d'entrée de l'issue asynchrone (webhook de l'orchestrateur réel). */
-  recordOutcome(reference: string, outcome: OrchestratorOutcome): Payment | undefined {
-    const payment = [...this.payments.values()].find((candidate) => candidate.orchestratorReference === reference);
+  /**
+   * Point d'entrée de l'issue asynchrone (webhook de l'orchestrateur réel), retrouvée par la référence de
+   * l'orchestrateur ou, à défaut, par l'identifiant du paiement (sa référence externe chez l'orchestrateur).
+   * Seul un paiement en cours change : un événement rejoué ou tardif est sans effet.
+   */
+  recordOutcome(reference: string, outcome: OrchestratorOutcome, paymentId?: string): Payment | undefined {
+    const payment = [...this.payments.values()].find((candidate) => candidate.orchestratorReference === reference)
+      ?? (paymentId ? this.payments.get(paymentId) : undefined);
     if (!payment || payment.status !== 'processing') return payment;
     this.applyOutcome(payment, outcome);
     return payment;
@@ -394,8 +399,9 @@ export class AppGn {
   }
 
   private nextId(prefix: string): string {
-    this.sequence += 1;
-    return `${prefix}_${this.sequence.toString().padStart(6, '0')}`;
+    // Unique d'un démarrage à l'autre : l'identifiant sert de clé d'idempotence chez l'orchestrateur réel,
+    // qui rejouerait un ancien paiement si un compteur repartait de zéro.
+    return `${prefix}_${globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 20)}`;
   }
 
   private assertCardUsable(account: LinkedAccount): void {
@@ -511,6 +517,8 @@ function defaultLabel(destination: PaymentDestination): string {
 export interface DemoOptions {
   now?: () => Date;
   aggregationTimeoutMs?: number;
+  /** Remplace l'orchestrateur simulé (par ORCHEA, côté serveur), construit sur le même réseau simulé. */
+  orchestrator?: (network: SimulatedNetwork, now: () => Date) => PaymentOrchestrator;
 }
 
 /** Monte une instance complète sur données fictives : réseau simulé, un connecteur simulé par fournisseur. */
@@ -525,7 +533,7 @@ export function createDemoApp(options: DemoOptions = {}): { app: AppGn; network:
     ...data,
     documents: seedDocuments(now()),
     connectors,
-    orchestrator: new SimulatedOrchestrator(network, now),
+    orchestrator: options.orchestrator?.(network, now) ?? new SimulatedOrchestrator(network, now),
     cardIssuer: new SimulatedCardIssuer(network, now),
     fx: DEMO_FX,
     now,

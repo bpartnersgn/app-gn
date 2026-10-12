@@ -163,3 +163,17 @@ function prng(key: string): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+/**
+ * Numéros complets (fictifs) des wallets Mobile Money de la démo. L'application n'en montre que la forme
+ * masquée ; seul le serveur les lit, pour les remettre à l'orchestrateur qui pousse le débit sur le téléphone.
+ */
+export const DEMO_WALLET_NUMBERS: Readonly<Record<string, string>> = {
+  acc_mc_om: '+224620000001',
+  acc_mc_mtn: '+224660000011',
+  acc_ad_om: '+224620000002',
+  acc_cm_om: '+224620001001',
+  acc_bl_om: '+224620002001',
+  acc_bl_mtn: '+224660002002',
+  acc_kal_om: '+224620003001',
+};

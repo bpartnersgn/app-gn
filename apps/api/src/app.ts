@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import type { OrcheaWebhookReceiver } from './orchea.ts';
 import { AppError, isChannel, type Actor, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type PaymentInput } from '@app-gn/core';
 
 /**
@@ -24,7 +25,7 @@ function keyOf(request: FastifyRequest): string {
   return typeof key === 'string' ? key : '';
 }
 
-export function buildServer(app: AppGn, options: { logger?: boolean } = {}): FastifyInstance {
+export function buildServer(app: AppGn, options: { logger?: boolean; orcheaWebhooks?: OrcheaWebhookReceiver } = {}): FastifyInstance {
   const server = Fastify({ logger: options.logger ?? false });
 
   server.setErrorHandler((error, _request, reply: FastifyReply) => {
@@ -38,6 +39,21 @@ export function buildServer(app: AppGn, options: { logger?: boolean } = {}): Fas
   });
 
   server.get('/health', async () => ({ status: 'ok' }));
+
+  // Issues de paiement envoyées par ORCHEA. La signature porte sur le corps exact : il est lu brut,
+  // dans un contexte à part pour ne pas changer la lecture JSON des autres routes.
+  const orcheaWebhooks = options.orcheaWebhooks;
+  if (orcheaWebhooks) {
+    server.register(async (scope) => {
+      scope.addContentTypeParser('application/json', { parseAs: 'string' }, (_request, body, done) => done(null, body));
+      scope.post('/v1/webhooks/orchea', async (request, reply) => {
+        const signature = request.headers['x-orchea-signature'];
+        const handled = orcheaWebhooks.handle(typeof request.body === 'string' ? request.body : '', typeof signature === 'string' ? signature : undefined);
+        if (handled.status === 200) request.log.info({ result: handled.result, paymentId: handled.paymentId }, 'webhook ORCHEA');
+        return reply.status(handled.status).send({ result: handled.result });
+      });
+    });
+  }
 
   server.get('/v1/demo/persons', async () => app.listPersons());
   server.get('/v1/catalog', async () => app.catalog());
