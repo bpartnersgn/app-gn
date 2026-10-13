@@ -170,14 +170,18 @@ describe('paiements', () => {
 
   it('administration : l’ordonnateur mandate, le comptable public paie ou rejette', async () => {
     const { app } = demo();
-    const mandate = await app.initiatePayment(A('per_fatoumata'), 'spc_adm_kaloum', {
-      sourceAccountId: 'acc_kal_tresor', amount: '12000000', destination: { type: 'mobile_money', operator: 'orange_money', phone: '+224 620 98 76 54', name: 'Entreprise Nettoyage' },
-    }, 'k5');
+    const input = {
+      sourceAccountId: 'acc_kal_tresor', amount: '12000000', destination: { type: 'mobile_money' as const, operator: 'orange_money' as const, phone: '+224 620 98 76 54', name: 'Entreprise Nettoyage' },
+    };
+    // Hors du bureau GAPP Institutionnel (engagement, liquidation, mandat), aucune dépense publique ne part.
+    await rejects(app.initiatePayment(A('per_fatoumata'), 'spc_adm_kaloum', input, 'k4'), 'invalid_request');
+    const mandate = await app.initiatePayment(A('per_fatoumata'), 'spc_adm_kaloum', input, 'k5', 'desk');
     assert.equal(mandate.status, 'pending_approval');
-    await rejects(app.approvePayment(A('per_fatoumata'), 'spc_adm_kaloum', mandate.id), 'forbidden');
-    const paid = await app.approvePayment(A('per_ibrahima'), 'spc_adm_kaloum', mandate.id);
+    await rejects(app.approvePayment(A('per_fatoumata'), 'spc_adm_kaloum', mandate.id, 'desk'), 'forbidden');
+    await rejects(app.approvePayment(A('per_ibrahima'), 'spc_adm_kaloum', mandate.id), 'invalid_request');
+    const paid = await app.approvePayment(A('per_ibrahima'), 'spc_adm_kaloum', mandate.id, 'desk');
     assert.equal(paid.status, 'completed');
-    await rejects(app.approvePayment(A('per_ibrahima'), 'spc_adm_kaloum', mandate.id), 'invalid_state');
+    await rejects(app.approvePayment(A('per_ibrahima'), 'spc_adm_kaloum', mandate.id, 'desk'), 'invalid_state');
   });
 
   it('le comptable public ne peut pas initier', async () => {

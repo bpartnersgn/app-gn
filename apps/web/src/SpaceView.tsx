@@ -13,19 +13,37 @@ import {
   type Currency,
   type MobileMoneyOperator,
   type Payment,
+  type Permission,
   type PaymentDestination,
   type ServiceDefinition,
   type SpaceAccess,
   type SpaceKind,
 } from '@app-gn/core';
+import { AgentsSection, BudgetSection, RevenueSection, SpendingSection } from './Administration.tsx';
+import { AuditSection, InvoicesSection, ScoreSection, SuppliersSection, TeamSection, TreasurySection, VatSection } from './Business.tsx';
 import { CardsSection } from './Cards.tsx';
 import { useOfflineStatus, useRead, useSession } from './context.ts';
 import { DocumentsSection } from './Documents.tsx';
 import { PAYMENT_STATUS, failureLabel, SPACE_KIND_LABELS, dateTime, fmt, shortDate } from './format.ts';
 
-export type Section = 'home' | 'pay' | 'cards' | 'documents' | 'services';
+export type Section =
+  | 'home' | 'pay' | 'cards' | 'documents' | 'services'
+  | 'invoices' | 'suppliers' | 'vat' | 'team' | 'score' | 'audit'
+  | 'budget' | 'spending' | 'agents' | 'revenue';
 
-export const SECTIONS: Record<SpaceKind, { id: Section; label: string; short?: string }[]> = {
+interface SectionDefinition {
+  id: Section;
+  label: string;
+  short?: string;
+  /** Au moins une de ces permissions ouvre la rubrique. */
+  anyOf?: Permission[];
+}
+
+/**
+ * Rubriques de chaque espace. Côté entreprise et administration, elles suivent la logique métier du rôle :
+ * la RH n'a ni la trésorerie ni les factures, le comptable public vise sans engager, le contrôle lit seulement.
+ */
+export const SECTIONS: Record<SpaceKind, SectionDefinition[]> = {
   citizen: [
     { id: 'home', label: 'Accueil' },
     { id: 'pay', label: 'Payer' },
@@ -34,18 +52,30 @@ export const SECTIONS: Record<SpaceKind, { id: Section; label: string; short?: s
     { id: 'services', label: 'Services' },
   ],
   business: [
-    { id: 'home', label: 'Trésorerie' },
-    { id: 'pay', label: 'Paiements' },
-    { id: 'documents', label: 'Documents' },
-    { id: 'services', label: 'Services' },
+    { id: 'home', label: 'Trésorerie', anyOf: ['payments:initiate', 'reports:read'] },
+    { id: 'invoices', label: 'Factures', anyOf: ['invoices:write', 'reports:read'] },
+    { id: 'suppliers', label: 'Fournisseurs', anyOf: ['invoices:write', 'payments:initiate', 'reports:read'] },
+    { id: 'pay', label: 'Paiements', anyOf: ['payments:initiate', 'payments:approve'] },
+    { id: 'vat', label: 'TVA', anyOf: ['tax:declare', 'reports:read'] },
+    { id: 'team', label: 'Équipe et paie', anyOf: ['payroll:submit'] },
+    { id: 'score', label: 'Score B2B', anyOf: ['reports:read'] },
+    { id: 'audit', label: 'Journal', anyOf: ['reports:read'] },
+    { id: 'documents', label: 'Documents', anyOf: ['documents:read'] },
   ],
   administration: [
-    { id: 'home', label: 'Situation' },
-    { id: 'pay', label: 'Mandats' },
-    { id: 'documents', label: 'Documents' },
-    { id: 'services', label: 'Services' },
+    { id: 'home', label: 'Situation', anyOf: ['accounts:read'] },
+    { id: 'budget', label: 'Budget', anyOf: ['budget:read'] },
+    { id: 'spending', label: 'Dépenses et mandats', anyOf: ['budget:engage', 'payments:approve'] },
+    { id: 'agents', label: 'Paie des agents', anyOf: ['payroll:submit', 'payments:approve'] },
+    { id: 'revenue', label: 'Recettes', anyOf: ['budget:read', 'reports:read'] },
+    { id: 'audit', label: 'Contrôle', anyOf: ['reports:read'] },
+    { id: 'documents', label: 'Documents', anyOf: ['documents:read'] },
   ],
 };
+
+export function sectionsFor(access: SpaceAccess): SectionDefinition[] {
+  return SECTIONS[access.space.kind].filter((section) => !section.anyOf || section.anyOf.some((permission) => access.permissions.includes(permission)));
+}
 
 const KIND_ORDER: AccountKind[] = ['bank', 'mobile_money', 'app_wallet', 'virtual_card', 'crypto'];
 
@@ -54,6 +84,7 @@ export function SpaceView({ access, section, onNavigate }: { access: SpaceAccess
   const bump = () => setVersion((value) => value + 1);
   const spaceId = access.space.id;
   const overview = useRead<ConsolidatedView>(`${spaceId}:overview`, ({ client, actor: a }) => client.base.overview(a, spaceId), version);
+  const desk = { access, positions: overview.data?.positions ?? [], version, onChange: bump };
 
   return (
     <main className="page">
@@ -66,8 +97,20 @@ export function SpaceView({ access, section, onNavigate }: { access: SpaceAccess
         </p>
       </section>
 
-      {section === 'home' && <HomeSection access={access} overview={overview} onNavigate={onNavigate} />}
+      {section === 'home' && (access.space.kind === 'business'
+        ? <TreasurySection {...desk} />
+        : <HomeSection access={access} overview={overview} onNavigate={onNavigate} />)}
       {section === 'pay' && <PaySection access={access} positions={overview.data?.positions ?? []} version={version} onChange={bump} />}
+      {section === 'invoices' && <InvoicesSection {...desk} />}
+      {section === 'suppliers' && <SuppliersSection {...desk} />}
+      {section === 'vat' && <VatSection {...desk} />}
+      {section === 'team' && <TeamSection {...desk} />}
+      {section === 'score' && <ScoreSection {...desk} />}
+      {section === 'audit' && <AuditSection {...desk} kind={access.space.kind === 'administration' ? 'administration' : 'business'} />}
+      {section === 'budget' && <BudgetSection {...desk} />}
+      {section === 'spending' && <SpendingSection {...desk} />}
+      {section === 'agents' && <AgentsSection {...desk} />}
+      {section === 'revenue' && <RevenueSection {...desk} />}
       {section === 'cards' && <CardsSection access={access} positions={overview.data?.positions ?? []} version={version} onChange={bump} />}
       {section === 'documents' && <DocumentsSection access={access} />}
       {section === 'services' && <ServicesSection access={access} />}
@@ -104,14 +147,12 @@ function QuickActions({ access, onNavigate }: { access: SpaceAccess; onNavigate:
       { section: 'documents' as const, title: 'Mes documents', text: 'Permis, assurance, carte grise : présentables sans réseau.' },
     ]
     : access.space.kind === 'business'
-      ? [
-        { section: 'pay' as const, title: 'Payer un fournisseur', text: `Au-delà de ${fmt(BUSINESS_APPROVAL_THRESHOLD)}, approbation du dirigeant.` },
-        { section: 'documents' as const, title: 'Documents de l’entreprise', text: 'RCCM, attestation fiscale, assurances, avec alerte avant expiration.' },
-      ]
+      ? []
       : [
-        { section: 'pay' as const, title: 'Mandats en cours', text: 'L’ordonnateur mandate, le comptable public vise et paie.' },
-        { section: 'documents' as const, title: 'Documents de l’entité', text: 'Conventions et attestations.' },
-      ];
+        { section: 'budget' as const, title: 'Exécution du budget', text: 'Voté, engagé, liquidé, mandaté, payé, ligne par ligne.' },
+        { section: 'spending' as const, title: 'Dépenses et mandats', text: 'L’ordonnateur engage et mandate, le comptable public vise et paie.' },
+        { section: 'agents' as const, title: 'Paie des agents', text: 'Contrôle des NIN, des doublons et des wallets avant tout mandat.' },
+      ].filter((item) => sectionsFor(access).some((candidate) => candidate.id === item.section));
   return (
     <section className="panel" aria-labelledby="quick-title">
       <h2 id="quick-title" className="panel-title">Raccourcis</h2>

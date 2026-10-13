@@ -18,3 +18,4 @@ export * from './gapp/desk.ts';
 export * from './gapp/business.ts';
 export * from './gapp/administration.ts';
 export * from './gapp/demo.ts';
+export * from './gapp/routes.ts';

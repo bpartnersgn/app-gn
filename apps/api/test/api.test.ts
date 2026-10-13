@@ -31,21 +31,15 @@ describe('API', () => {
     assert.equal(ko.statusCode, 403);
   });
 
-  it('mandat → visa : 201 en attente, 403 pour l’ordonnateur, 200 pour le comptable', async () => {
+  it('en administration, pas de paiement direct : la dépense passe par le bureau GAPP Institutionnel', async () => {
     const app = server();
     const created = await app.inject({
       method: 'POST', url: '/v1/spaces/spc_adm_kaloum/payments',
       headers: { ...as('per_fatoumata'), 'idempotency-key': 'm-1' },
       payload: { sourceAccountId: 'acc_kal_tresor', amount: '5000000', destination: { type: 'own_account', accountId: 'acc_kal_eco' } },
     });
-    assert.equal(created.statusCode, 201);
-    assert.equal(created.json().status, 'pending_approval');
-    const id = created.json().id;
-    const denied = await app.inject({ method: 'POST', url: `/v1/spaces/spc_adm_kaloum/payments/${id}/approve`, headers: as('per_fatoumata') });
-    assert.equal(denied.statusCode, 403);
-    const paid = await app.inject({ method: 'POST', url: `/v1/spaces/spc_adm_kaloum/payments/${id}/approve`, headers: as('per_ibrahima') });
-    assert.equal(paid.statusCode, 200);
-    assert.equal(paid.json().status, 'completed');
+    assert.equal(created.statusCode, 400);
+    assert.match(created.json().message, /engagement/);
   });
 
   it('exige une clé d’idempotence', async () => {

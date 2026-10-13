@@ -1,6 +1,8 @@
 import {
   AppError,
   createDemoApp,
+  loadDemoGapp,
+  matchGappRoute,
   type AccountTransaction,
   type Actor,
   type CardNetwork,
@@ -61,6 +63,8 @@ export interface AppGnClient {
   setCardFrozen(actor: Actor, spaceId: string, accountId: string, frozen: boolean): Promise<CardView>;
   quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput): Promise<ExchangeQuote>;
   executeExchange(actor: Actor, spaceId: string, quoteId: string, idempotencyKey: string): Promise<Exchange>;
+  /** Tableaux de bord GAPP : `path` sous `/v1/spaces/:spaceId/` (`business/treasury`, `administration/budget`…). */
+  desk<T>(actor: Actor, spaceId: string, method: 'GET' | 'POST', path: string, body?: unknown, idempotencyKey?: string): Promise<T>;
 }
 
 export class ClientError extends Error {
@@ -182,11 +186,15 @@ class HttpClient implements AppGnClient {
   executeExchange(actor: Actor, spaceId: string, quoteId: string, key: string) {
     return this.call<Exchange>(actor, 'POST', `/v1/spaces/${spaceId}/exchanges`, { quoteId }, { 'idempotency-key': key });
   }
+  desk<T>(actor: Actor, spaceId: string, method: 'GET' | 'POST', path: string, body?: unknown, key?: string) {
+    return this.call<T>(actor, method, `/v1/spaces/${spaceId}/${path}`, method === 'POST' ? body ?? {} : undefined, key ? { 'idempotency-key': key } : {});
+  }
 }
 
 class EmbeddedClient implements AppGnClient {
   readonly mode = 'embedded' as const;
   private readonly app = createDemoApp().app;
+  private readonly gapp = loadDemoGapp(this.app);
   private readonly challenges = new Map<string, { personId?: string; code: string; expiresAt: number }>();
   private readonly selections = new Map<string, string>();
 
@@ -248,6 +256,15 @@ class EmbeddedClient implements AppGnClient {
   setCardFrozen(actor: Actor, spaceId: string, accountId: string, frozen: boolean) { return this.run(() => this.app.setCardFrozen(actor, spaceId, accountId, frozen)); }
   quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput) { return this.run(() => this.app.quoteExchange(actor, spaceId, input)); }
   executeExchange(actor: Actor, spaceId: string, quoteId: string, key: string) { return this.run(() => this.app.executeExchange(actor, spaceId, quoteId, key)); }
+  // Même table de routes que l'API : le mode démo sert les tableaux de bord GAPP sans serveur.
+  desk<T>(actor: Actor, spaceId: string, method: 'GET' | 'POST', path: string, body?: unknown, key?: string) {
+    return this.run(async () => {
+      const match = matchGappRoute(method, `/v1/spaces/${encodeURIComponent(spaceId)}/${path}`);
+      if (!match) throw new AppError('not_found', 'route inconnue');
+      const { spaceId: _space, ...params } = match.params;
+      return match.route.handle(await this.gapp, { actor, spaceId, params, body: (structuredClone(body) ?? {}) as Record<string, unknown>, key: key ?? '' }) as Promise<T>;
+    });
+  }
 }
 
 export function createBaseClient(): AppGnClient {

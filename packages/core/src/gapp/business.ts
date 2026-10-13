@@ -393,7 +393,8 @@ export class BusinessDesk {
     }
     let overduePayables = 0n;
     for (const bill of await this.billViews(actor, spaceId, today)) {
-      if (bill.state === 'overdue') overduePayables += toBigInt(bill.amount);
+      // Échue tant qu'elle n'est pas réglée, même si un lot attend la validation.
+      if (bill.dueDate < today && (bill.state === 'overdue' || bill.state === 'awaiting_approval')) overduePayables += toBigInt(bill.amount);
       if (['to_pay', 'overdue', 'awaiting_approval'].includes(bill.state)) {
         plan(bill.dueDate, { kind: 'payable', label: `${bill.supplier.name} · ${bill.reference}`, amount: bill.amount });
       }

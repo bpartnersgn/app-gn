@@ -83,12 +83,12 @@ describe('PostgreSQL', () => {
     const app = (await loadDemoApp({ store })).app;
     const mandate = await app.initiatePayment(ordonnateur, 'spc_adm_kaloum', {
       sourceAccountId: 'acc_kal_tresor', amount: '5000000', destination: { type: 'own_account', accountId: 'acc_kal_eco' },
-    }, 'pg-mandat-1');
+    }, 'pg-mandat-1', 'desk');
     assert.equal(mandate.status, 'pending_approval');
     const other = (await loadDemoApp({ store })).app;
     const results = await Promise.allSettled([
-      app.approvePayment(comptable, 'spc_adm_kaloum', mandate.id),
-      other.approvePayment(comptable, 'spc_adm_kaloum', mandate.id),
+      app.approvePayment(comptable, 'spc_adm_kaloum', mandate.id, 'desk'),
+      other.approvePayment(comptable, 'spc_adm_kaloum', mandate.id, 'desk'),
     ]);
     assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
     assert.equal((await store.payment(mandate.id))?.status, 'completed');

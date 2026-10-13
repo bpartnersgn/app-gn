@@ -4,7 +4,7 @@ import { createBaseClient, type CodeChallenge, type OpenedSession, type SignInOu
 import { SessionContext, useOfflineStatus, useViewportChannel } from './context.ts';
 import { SPACE_KIND_SHORT, dateTime } from './format.ts';
 import { OfflineClient } from './offline.ts';
-import { SECTIONS, SpaceView, type Section } from './SpaceView.tsx';
+import { sectionsFor, SpaceView, type Section } from './SpaceView.tsx';
 
 const client = new OfflineClient(createBaseClient());
 
@@ -120,7 +120,9 @@ export function App() {
   const active = me.spaces[0]!;
   const kind = active.space.kind;
   const layout: 'app' | 'web' | 'dashboard' = kind !== 'citizen' ? 'dashboard' : channel === 'phone' ? 'app' : 'web';
-  const sections = SECTIONS[kind];
+  const sections = sectionsFor(active);
+  // Une rubrique que ce rôle n'a pas (la RH n'a pas la trésorerie) : on ouvre la première qu'il a.
+  const current: Section = sections.some((item) => item.id === section) ? section : sections[0]?.id ?? 'documents';
 
   return (
     <SessionContext.Provider value={session}>
@@ -159,20 +161,20 @@ export function App() {
               {layout !== 'app' && (
                 <nav className={layout === 'dashboard' ? 'sidenav' : 'toptabs'} aria-label="Rubriques">
                   {sections.map((item) => (
-                    <button key={item.id} type="button" className="nav-item" aria-current={section === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}>
+                    <button key={item.id} type="button" className="nav-item" aria-current={current === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}>
                       {item.label}
                     </button>
                   ))}
                 </nav>
               )}
-              <SpaceView key={`${me.person.id}:${active.space.id}`} access={active} section={section} onNavigate={setSection} />
+              <SpaceView key={`${me.person.id}:${active.space.id}`} access={active} section={current} onNavigate={setSection} />
             </div>
           )}
 
           {layout === 'app' && (
             <nav className="tabbar" aria-label="Rubriques">
               {sections.map((item) => (
-                <button key={item.id} type="button" className="tab" aria-current={section === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}>
+                <button key={item.id} type="button" className="tab" aria-current={current === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}>
                   <TabIcon section={item.id} />
                   <span>{item.short ?? item.label}</span>
                 </button>
@@ -407,7 +409,7 @@ function OfflineBanner() {
 }
 
 function TabIcon({ section }: { section: Section }) {
-  const paths: Record<Section, string> = {
+  const paths: Partial<Record<Section, string>> = {
     home: 'M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z',
     pay: 'M4 7h13l-3-3m6 13H7l3 3',
     cards: 'M3 6h18v12H3zM3 10h18',
@@ -416,7 +418,7 @@ function TabIcon({ section }: { section: Section }) {
   };
   return (
     <svg className="tab-icon" viewBox="0 0 24 24" aria-hidden="true">
-      <path d={paths[section]} fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
+      <path d={paths[section] ?? paths.services} fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
     </svg>
   );
 }

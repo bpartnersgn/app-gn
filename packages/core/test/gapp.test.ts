@@ -271,6 +271,8 @@ describe('GAPP Entreprise : trésorerie, score, journal, audit', () => {
     assert.deepEqual(couture.lowest, { date: '2026-10-17', balance: { amount: '-520000', currency: 'GNF' } });
     const boke = await business.treasury(sekou, BOKE);
     assert.equal(boke.tension, false);
+    // SKC-0912 est échue depuis cinq jours : le lot qui la règle attend encore la validation, elle compte.
+    assert.equal(boke.overduePayables.amount, '18400000');
     assert.ok(boke.projection.some((day) => day.items.some((item) => item.kind === 'vat' && item.label === 'TVA 2026-09')));
     // Les avoirs en dollars restent à part : ils ne paient pas une échéance en GNF.
     assert.deepEqual(boke.foreign.map((entry) => entry.accountId), ['acc_bl_eco_usd']);

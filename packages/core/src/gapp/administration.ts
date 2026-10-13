@@ -355,7 +355,7 @@ export class AdministrationDesk {
       amount: toMajor(liquidation.amount),
       destination: { type: 'mobile_money', operator: engagement.payee.operator, phone: engagement.payee.phone, name: engagement.supplier.name },
       label: `${mandateNumber} · ${engagement.object}`,
-    }, `${liquidationId}:${attempt}`);
+    }, `${liquidationId}:${attempt}`, 'desk');
     const updated = await mutate<Engagement>(this.store, 'engagements', engagementId, async (current) => {
       const liquidations = await Promise.all(current!.liquidations.map(async (candidate) => {
         if (candidate.id !== liquidationId) return candidate;
@@ -384,7 +384,7 @@ export class AdministrationDesk {
       throw new AppError('invalid_state', 'le bénéficiaire du mandat ne correspond pas à l’engagement : rejetez-le');
     }
     if (payment.amount.amount !== liquidation.amount.amount) throw new AppError('invalid_state', 'le montant du mandat ne correspond pas à la liquidation : rejetez-le');
-    const paid = await this.app.approvePayment(actor, spaceId, payment.id);
+    const paid = await this.app.approvePayment(actor, spaceId, payment.id, 'desk');
     await this.record(context, actor, 'mandate.approved', payment.id, `${liquidation.mandate!.number} visé et payé · ${paid.status}`);
     return this.viewOf(actor, spaceId, engagementId);
   }
@@ -393,7 +393,7 @@ export class AdministrationDesk {
     const context = this.context(actor, spaceId, 'payments:approve');
     const motive = text(reason, 'motif du rejet', 300);
     const { liquidation, payment } = await this.mandated(spaceId, engagementId, liquidationId);
-    await this.app.rejectPayment(actor, spaceId, payment.id, motive);
+    await this.app.rejectPayment(actor, spaceId, payment.id, motive, 'desk');
     await this.record(context, actor, 'mandate.rejected', payment.id, `${liquidation.mandate!.number} rejeté : ${motive}`);
     return this.viewOf(actor, spaceId, engagementId);
   }
@@ -512,7 +512,7 @@ export class AdministrationDesk {
           amount: toMajor(line.amount),
           destination: { type: 'mobile_money', operator: agent.payout.operator, phone: agent.payout.phone, name: agent.fullName },
           label: `Traitement ${period} · ${line.matricule}`,
-        }, `${id}:${line.agentId}`);
+        }, `${id}:${line.agentId}`, 'desk');
         line.paymentId = payment.id;
         payments.set(payment.id, payment);
       } catch (error) {
@@ -541,7 +541,7 @@ export class AdministrationDesk {
       if (!line.paymentId) continue;
       const payment = await this.app.paymentOf(spaceId, line.paymentId);
       if (payment?.status !== 'pending_approval') continue;
-      await this.app.approvePayment(actor, spaceId, line.paymentId);
+      await this.app.approvePayment(actor, spaceId, line.paymentId, 'desk');
       paid += 1;
     }
     if (paid === 0) throw new AppError('invalid_state', 'aucun mandat de cette paie n’attend de visa');

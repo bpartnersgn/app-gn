@@ -234,8 +234,13 @@ export class AppGn {
     return this.store.paymentsOfSpace(spaceId);
   }
 
-  async initiatePayment(actor: Actor, spaceId: string, input: PaymentInput, idempotencyKey: string): Promise<Payment> {
+  /**
+   * `origin: 'desk'` : appel d'un bureau GAPP. En administration, une dépense ne part que par la chaîne
+   * engagement → liquidation → mandat → visa ; un paiement direct y est refusé.
+   */
+  async initiatePayment(actor: Actor, spaceId: string, input: PaymentInput, idempotencyKey: string, origin?: 'desk'): Promise<Payment> {
     const { space, role } = this.authorize(actor, spaceId, 'payments:initiate');
+    this.assertPublicChain(space, origin);
     const id = this.nextId('pay');
     const claim = this.scope(actor, spaceId, 'payment', idempotencyKey);
     const replay = await this.claim(claim, [input.sourceAccountId, input.amount, input.destination, input.label ?? null], id);
@@ -277,8 +282,9 @@ export class AppGn {
     return payment;
   }
 
-  async approvePayment(actor: Actor, spaceId: string, paymentId: string): Promise<Payment> {
-    this.authorize(actor, spaceId, 'payments:approve');
+  async approvePayment(actor: Actor, spaceId: string, paymentId: string, origin?: 'desk'): Promise<Payment> {
+    const { space } = this.authorize(actor, spaceId, 'payments:approve');
+    this.assertPublicChain(space, origin);
     const payment = await this.pendingPayment(spaceId, paymentId);
     if (payment.initiatedBy === actor.personId) {
       throw new AppError('separation_of_duties', 'l’initiateur d’un paiement ne peut pas l’approuver');
@@ -287,8 +293,9 @@ export class AppGn {
     return this.submit(payment);
   }
 
-  async rejectPayment(actor: Actor, spaceId: string, paymentId: string, reason?: string): Promise<Payment> {
-    this.authorize(actor, spaceId, 'payments:approve');
+  async rejectPayment(actor: Actor, spaceId: string, paymentId: string, reason?: string, origin?: 'desk'): Promise<Payment> {
+    const { space } = this.authorize(actor, spaceId, 'payments:approve');
+    this.assertPublicChain(space, origin);
     const payment = await this.pendingPayment(spaceId, paymentId);
     payment.decidedBy = actor.personId;
     payment.status = 'rejected';
@@ -544,6 +551,12 @@ export class AppGn {
     // Unique d'un démarrage à l'autre : l'identifiant sert de clé d'idempotence chez l'orchestrateur réel,
     // qui rejouerait un ancien paiement si un compteur repartait de zéro.
     return `${prefix}_${globalThis.crypto.randomUUID().replaceAll('-', '').slice(0, 20)}`;
+  }
+
+  private assertPublicChain(space: Space, origin?: 'desk'): void {
+    if (space.kind === 'administration' && origin !== 'desk') {
+      throw new AppError('invalid_request', 'en administration, une dépense passe par l’engagement, la liquidation, le mandat et le visa du comptable');
+    }
   }
 
   private assertCardUsable(account: LinkedAccount): void {
