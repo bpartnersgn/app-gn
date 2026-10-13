@@ -20,6 +20,8 @@ export const DEMO_PERSONS: Person[] = [
   { id: 'per_sekou', nin: 'GN-NIN-0000000005', fullName: 'Sékou Condé', phone: '+224 622 00 00 05' },
   // Le cas le plus courant : une personne qui n'a que son espace personnel.
   { id: 'per_kadiatou', nin: 'GN-NIN-0000000006', fullName: 'Kadiatou Sow', phone: '+224 625 00 00 06' },
+  { id: 'per_aissatou', nin: 'GN-NIN-0000000007', fullName: 'Aïssatou Barry', phone: '+224 628 00 00 07' },
+  { id: 'per_mamadou', nin: 'GN-NIN-0000000008', fullName: 'Mamadou Touré', phone: '+224 627 00 00 08' },
 ];
 
 export const DEMO_SPACES: Space[] = [
@@ -29,6 +31,8 @@ export const DEMO_SPACES: Space[] = [
   { id: 'spc_cit_ibrahima', kind: 'citizen', name: 'Ibrahima Sylla', ownerPersonId: 'per_ibrahima' },
   { id: 'spc_cit_sekou', kind: 'citizen', name: 'Sékou Condé', ownerPersonId: 'per_sekou' },
   { id: 'spc_cit_kadiatou', kind: 'citizen', name: 'Kadiatou Sow', ownerPersonId: 'per_kadiatou' },
+  { id: 'spc_cit_aissatou', kind: 'citizen', name: 'Aïssatou Barry', ownerPersonId: 'per_aissatou' },
+  { id: 'spc_cit_mamadou', kind: 'citizen', name: 'Mamadou Touré', ownerPersonId: 'per_mamadou' },
   { id: 'spc_biz_couture', kind: 'business', name: 'Couture Mariama', legalForm: 'SARLU', rccm: 'GN.TCC.2025.A.00001', nif: '000000001' },
   { id: 'spc_biz_boke', kind: 'business', name: 'Boké Logistique', legalForm: 'SA', rccm: 'GN.TCC.2019.B.00002', nif: '000000002' },
   { id: 'spc_adm_kaloum', kind: 'administration', name: 'Commune de Kaloum', entityType: 'collectivite' },
@@ -46,7 +50,30 @@ export const DEMO_MEMBERSHIPS: Membership[] = [
   { personId: 'per_ibrahima', spaceId: 'spc_cit_ibrahima', role: 'citizen' },
   { personId: 'per_ibrahima', spaceId: 'spc_adm_kaloum', role: 'admin_public_accountant' },
   { personId: 'per_kadiatou', spaceId: 'spc_cit_kadiatou', role: 'citizen' },
+  { personId: 'per_aissatou', spaceId: 'spc_cit_aissatou', role: 'citizen' },
+  { personId: 'per_aissatou', spaceId: 'spc_biz_boke', role: 'business_hr' },
+  { personId: 'per_mamadou', spaceId: 'spc_cit_mamadou', role: 'citizen' },
+  { personId: 'per_mamadou', spaceId: 'spc_adm_kaloum', role: 'admin_viewer' },
 ];
+
+/**
+ * Registre national des personnes (simulé) : ce que la paie publique interroge pour vérifier un NIN.
+ * Il contient les personnes de la démo et des salariés ou agents qui n'utilisent pas App GN.
+ */
+export const DEMO_CIVIL_REGISTRY: Readonly<Record<string, string>> = {
+  ...Object.fromEntries(DEMO_PERSONS.map((person) => [person.nin, person.fullName])),
+  'GN-NIN-0000000101': 'Mamadou Bah',
+  'GN-NIN-0000000102': 'Ousmane Keïta',
+  'GN-NIN-0000000103': 'Lansana Camara',
+  'GN-NIN-0000000104': 'Fodé Soumah',
+  'GN-NIN-0000000105': 'Aminata Diallo',
+  'GN-NIN-0000000201': 'Hawa Touré',
+  'GN-NIN-0000000202': 'Saliou Diallo',
+  'GN-NIN-0000000203': 'Mariame Kaba',
+  'GN-NIN-0000000204': 'Abdoulaye Sylla',
+  'GN-NIN-0000000205': 'Djénabou Barry',
+  'GN-NIN-0000000206': 'Moussa Camara',
+};
 
 interface AccountSeed {
   id: string;

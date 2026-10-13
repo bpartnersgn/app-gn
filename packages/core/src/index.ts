@@ -14,3 +14,7 @@ export * from './cards.ts';
 export * from './sync.ts';
 export * from './store.ts';
 export * from './app.ts';
+export * from './gapp/desk.ts';
+export * from './gapp/business.ts';
+export * from './gapp/administration.ts';
+export * from './gapp/demo.ts';

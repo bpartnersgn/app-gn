@@ -25,6 +25,8 @@ export interface Payment {
   decidedBy?: string;
   orchestratorReference?: string;
   failureReason?: string;
+  /** Motif donné par qui a refusé (visa du comptable public, approbation du dirigeant). */
+  rejectionReason?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -34,6 +36,7 @@ export const BILLERS = [
   { id: 'seg', name: 'SEG — Société des Eaux de Guinée' },
   { id: 'canal', name: 'Canal+ Guinée' },
   { id: 'ecole', name: 'Frais de scolarité' },
+  { id: 'dgi', name: 'DGI — Direction générale des impôts' },
 ] as const;
 
 /** Seuil d'approbation côté entreprise (repris des cas d'usage GAPP : MFA au-delà de 5 M GNF). */

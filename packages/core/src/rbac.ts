@@ -9,6 +9,7 @@ export type Permission =
   | 'tax:declare'
   | 'payroll:submit'
   | 'budget:read'
+  | 'budget:engage'
   | 'reports:read'
   | 'members:manage'
   | 'documents:read'
@@ -51,7 +52,7 @@ export const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
   business_finance: ['accounts:read', 'accounts:link', 'payments:initiate', 'invoices:write', 'tax:declare', 'reports:read', 'documents:read'],
   business_accountant: ['accounts:read', 'invoices:write', 'reports:read', 'documents:read'],
   business_hr: ['accounts:read', 'payroll:submit', 'documents:read', 'documents:write'],
-  admin_authorizing_officer: ['accounts:read', 'payments:initiate', 'payroll:submit', 'budget:read', 'reports:read', 'documents:read'],
+  admin_authorizing_officer: ['accounts:read', 'payments:initiate', 'payroll:submit', 'budget:read', 'budget:engage', 'reports:read', 'documents:read'],
   admin_public_accountant: ['accounts:read', 'payments:approve', 'budget:read', 'reports:read', 'documents:read'],
   admin_viewer: ['accounts:read', 'budget:read', 'reports:read', 'documents:read'],
 };

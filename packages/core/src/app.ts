@@ -287,11 +287,12 @@ export class AppGn {
     return this.submit(payment);
   }
 
-  async rejectPayment(actor: Actor, spaceId: string, paymentId: string): Promise<Payment> {
+  async rejectPayment(actor: Actor, spaceId: string, paymentId: string, reason?: string): Promise<Payment> {
     this.authorize(actor, spaceId, 'payments:approve');
     const payment = await this.pendingPayment(spaceId, paymentId);
     payment.decidedBy = actor.personId;
     payment.status = 'rejected';
+    if (reason?.trim()) payment.rejectionReason = reason.trim().slice(0, 500);
     payment.updatedAt = this.now().toISOString();
     if (!await this.store.updatePayment(payment, 'pending_approval')) throw new AppError('invalid_state', 'paiement déjà décidé');
     return payment;
@@ -451,6 +452,70 @@ export class AppGn {
 
   catalog() {
     return { providers: PROVIDERS, billers: BILLERS, cardIssuePriceGnf: CARD_ISSUE_PRICE_GNF, fx: Object.fromEntries(Object.entries(this.deps.fx).map(([currency, rate]) => [currency, String(rate)])) };
+  }
+
+  // ── Pour les bureaux GAPP (entreprise, administration) ────────────────────
+  // Ils passent par `guard` pour leur propre contrôle d'accès, puis lisent ou agissent par ce qui suit.
+
+  /**
+   * Contrôle d'accès d'un bureau GAPP : session liée à l'espace, membre, appareil admis, espace de la bonne
+   * nature, et au moins une des permissions demandées.
+   */
+  guard(actor: Actor, spaceId: string, permissions: Permission | readonly Permission[], kind: Space['kind']): { space: Space; role: Role; person: Person } {
+    const access = this.access(actor, spaceId);
+    if (access.space.kind !== kind) throw new AppError('not_found', 'ce tableau de bord n’existe pas pour cet espace');
+    const wanted = typeof permissions === 'string' ? [permissions] : permissions;
+    if (!wanted.some((permission) => can(access.role, permission))) {
+      throw new AppError('forbidden', `votre rôle ne permet pas : ${wanted.join(' ou ')}`);
+    }
+    return { ...access, person: this.person(actor.personId) };
+  }
+
+  /** Comptes rattachés à l'espace (sans solde). À n'appeler qu'après `guard`. */
+  linkedAccounts(spaceId: string): LinkedAccount[] {
+    return this.accountsOf(spaceId);
+  }
+
+  /** Un paiement de l'espace, tel qu'enregistré. À n'appeler qu'après `guard`. */
+  async paymentOf(spaceId: string, paymentId: string): Promise<Payment | undefined> {
+    const payment = await this.store.payment(paymentId);
+    return payment?.spaceId === spaceId ? payment : undefined;
+  }
+
+  /** Les documents d'un espace, sans contrôle d'accès : pour un bureau qui en lit la validité après `guard`. */
+  documentsOf(spaceId: string): DocumentView[] {
+    const now = this.now();
+    return this.deps.documents.filter((document) => document.spaceId === spaceId).map((document) => documentView(document, now));
+  }
+
+  /**
+   * Remet un document émis par une organisation (attestation de travail…) dans le coffre personnel de la
+   * personne qui porte ce NIN. Rien n'est rendu à l'émetteur : il n'apprend pas si la personne utilise App GN.
+   */
+  depositIssuedDocument(nin: string, document: Omit<VaultDocument, 'spaceId'>): void {
+    const person = this.personByNin(nin);
+    if (!person) return;
+    const space = this.deps.spaces.find((candidate) => candidate.kind === 'citizen' && candidate.ownerPersonId === person.id);
+    if (!space || this.deps.documents.some((candidate) => candidate.id === document.id)) return;
+    this.deps.documents.push({ ...document, spaceId: space.id, holderName: person.fullName });
+  }
+
+  /** Vérifie qu'un document émis par une organisation est connu (pour le code de vérification public). */
+  hasDocument(id: string): boolean {
+    return this.deps.documents.some((document) => document.id === id);
+  }
+
+  /** Identifiants des espaces d'une nature (chargement des bureaux au démarrage). */
+  spaceIdsOfKind(kind: Space['kind']): string[] {
+    return this.deps.spaces.filter((space) => space.kind === kind).map((space) => space.id);
+  }
+
+  personById(personId: string): Person | undefined {
+    return this.deps.persons.find((person) => person.id === personId);
+  }
+
+  clock(): Date {
+    return this.now();
   }
 
   // ── Interne ────────────────────────────────────────────────────────────────
