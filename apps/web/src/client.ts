@@ -17,6 +17,7 @@ import {
   type PaymentInput,
   type Person,
   type ServiceDefinition,
+  type SpaceEntry,
 } from '@app-gn/core';
 
 /** Ce dont l'interface a besoin, servi soit par l'API HTTP, soit par le noyau embarqué (mode démo). */
@@ -27,12 +28,23 @@ export interface CodeChallenge {
   demoCode?: string;
 }
 
+/** Une session s'ouvre dans un seul espace : personnel, ou une organisation. */
+export interface OpenedSession {
+  personId: string;
+  spaceId: string;
+}
+
+export type SignInOutcome =
+  | ({ kind: 'session' } & OpenedSession)
+  | { kind: 'choose_space'; selectionToken: string; spaces: SpaceEntry[] };
+
 export interface AppGnClient {
   readonly mode: 'api' | 'embedded';
-  /** Connexion : NIN → code par SMS → session. */
+  /** Connexion : NIN → code par SMS → session dans un espace (nommé d'avance, ou choisi ensuite). */
   requestCode(nin: string): Promise<CodeChallenge>;
-  openSession(challengeId: string, code: string): Promise<{ personId: string }>;
-  signOut(personId: string): Promise<void>;
+  openSession(challengeId: string, code: string, spaceId?: string): Promise<SignInOutcome>;
+  selectSpace(selectionToken: string, spaceId: string): Promise<OpenedSession>;
+  signOut(session: OpenedSession): Promise<void>;
   persons(): Promise<Person[]>;
   me(actor: Actor): Promise<MeView>;
   overview(actor: Actor, spaceId: string): Promise<ConsolidatedView>;
@@ -89,22 +101,36 @@ class HttpClient implements AppGnClient {
     this.base = base.replace(/\/$/, '');
   }
 
-  private authorization(personId: string): string {
-    const token = this.sessions[personId];
-    return token ? `Bearer ${token}` : `Bearer demo:${personId}`;
+  /** Jeton de la session ouverte dans cet espace ; à défaut (accès rapide de démo), la connexion de démo liée au même espace. */
+  private authorization(actor: Actor): string {
+    const token = actor.spaceId ? this.sessions[`${actor.personId}@${actor.spaceId}`] : undefined;
+    if (token) return `Bearer ${token}`;
+    return actor.spaceId ? `Bearer demo:${actor.personId}@${actor.spaceId}` : `Bearer demo:${actor.personId}`;
+  }
+
+  private keep(token: string, me: MeView): OpenedSession {
+    const session = { personId: me.person.id, spaceId: me.spaces[0]!.space.id };
+    this.sessions[`${session.personId}@${session.spaceId}`] = token;
+    saveSessions(this.sessions);
+    return session;
   }
 
   requestCode(nin: string) { return this.call<CodeChallenge>(null, 'POST', '/v1/auth/codes', { nin }); }
-  async openSession(challengeId: string, code: string) {
-    const { token, me } = await this.call<{ token: string; me: MeView }>(null, 'POST', '/v1/auth/sessions', { challengeId, code });
-    this.sessions[me.person.id] = token;
-    saveSessions(this.sessions);
-    return { personId: me.person.id };
+  async openSession(challengeId: string, code: string, spaceId?: string): Promise<SignInOutcome> {
+    const result = await this.call<{ token: string; me: MeView } | { chooseSpace: true; selectionToken: string; spaces: SpaceEntry[] }>(
+      null, 'POST', '/v1/auth/sessions', { challengeId, code, ...(spaceId ? { spaceId } : {}) });
+    if ('chooseSpace' in result) return { kind: 'choose_space', selectionToken: result.selectionToken, spaces: result.spaces };
+    return { kind: 'session', ...this.keep(result.token, result.me) };
   }
-  async signOut(personId: string) {
-    const token = this.sessions[personId];
+  async selectSpace(selectionToken: string, spaceId: string) {
+    const { token, me } = await this.call<{ token: string; me: MeView }>(null, 'POST', '/v1/auth/sessions/space', { selectionToken, spaceId });
+    return this.keep(token, me);
+  }
+  async signOut(session: OpenedSession) {
+    const key = `${session.personId}@${session.spaceId}`;
+    const token = this.sessions[key];
     if (!token) return;
-    delete this.sessions[personId];
+    delete this.sessions[key];
     saveSessions(this.sessions);
     await this.call<void>(null, 'DELETE', '/v1/auth/sessions/current', undefined, { authorization: `Bearer ${token}` }).catch(() => undefined);
   }
@@ -115,7 +141,7 @@ class HttpClient implements AppGnClient {
       response = await fetch(`${this.base}${path}`, {
         method,
         headers: {
-          ...(actor ? { authorization: this.authorization(actor.personId), 'appgn-channel': actor.channel } : {}),
+          ...(actor ? { authorization: this.authorization(actor), 'appgn-channel': actor.channel } : {}),
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
           ...headers,
         },
@@ -162,6 +188,7 @@ class EmbeddedClient implements AppGnClient {
   readonly mode = 'embedded' as const;
   private readonly app = createDemoApp().app;
   private readonly challenges = new Map<string, { personId?: string; code: string; expiresAt: number }>();
+  private readonly selections = new Map<string, string>();
 
   // Démonstration sans serveur : même parcours que l'API, le code est montré au lieu d'être envoyé par SMS.
   async requestCode(nin: string): Promise<CodeChallenge> {
@@ -173,13 +200,25 @@ class EmbeddedClient implements AppGnClient {
     this.challenges.set(challengeId, { personId: person?.id, code, expiresAt });
     return { challengeId, expiresAt: new Date(expiresAt).toISOString(), ...(person ? { demoCode: code } : {}) };
   }
-  async openSession(challengeId: string, code: string) {
+  async openSession(challengeId: string, code: string, spaceId?: string): Promise<SignInOutcome> {
     const challenge = this.challenges.get(challengeId);
     if (!challenge?.personId || challenge.code !== code.trim() || challenge.expiresAt < Date.now()) {
       throw new ClientError('unauthenticated', 'code incorrect ou expiré');
     }
+    const spaces = this.app.entrances(challenge.personId, 'desktop');
+    if (spaceId && !spaces.some((space) => space.id === spaceId)) throw new ClientError('not_a_member', 'espace inaccessible');
     this.challenges.delete(challengeId);
-    return { personId: challenge.personId };
+    if (spaceId || spaces.length === 1) return { kind: 'session', personId: challenge.personId, spaceId: spaceId ?? spaces[0]!.id };
+    const selectionToken = crypto.randomUUID();
+    this.selections.set(selectionToken, challenge.personId);
+    return { kind: 'choose_space', selectionToken, spaces };
+  }
+  async selectSpace(selectionToken: string, spaceId: string) {
+    const personId = this.selections.get(selectionToken);
+    if (!personId) throw new ClientError('unauthenticated', 'choix expiré : reconnectez-vous');
+    if (!this.app.entrances(personId, 'desktop').some((space) => space.id === spaceId)) throw new ClientError('not_a_member', 'espace inaccessible');
+    this.selections.delete(selectionToken);
+    return { personId, spaceId };
   }
   async signOut() {}
 

@@ -50,6 +50,8 @@ export class OfflineClient {
   private readonly outbox: Outbox;
   private status: OfflineStatus;
   private readonly listeners = new Set<() => void>();
+  /** La session ouverte : seules ses opérations en file partent à la synchronisation. */
+  private session: Actor | null = null;
 
   constructor(base: AppGnClient, store: KeyValueStore = new BrowserStore()) {
     this.base = base;
@@ -64,6 +66,22 @@ export class OfflineClient {
   }
 
   get mode() { return this.base.mode; }
+
+  /** Ouvre ou ferme la session de l'appareil. Rejoue alors ce qui attendait pour cet espace. */
+  setSession(actor: Actor | null) {
+    this.session = actor;
+    void this.refreshPending();
+    if (actor) void this.sync();
+  }
+
+  /**
+   * Quitter un espace efface ce qui en était gardé sur l'appareil : sur une tablette de bureau partagée,
+   * les soldes personnels ne restent pas après une session d'entreprise, ni l'inverse.
+   * Les paiements en file restent : ce sont des ordres de la personne, rejoués à son retour dans cet espace.
+   */
+  async forget(actor: Actor) {
+    await this.cache.forget(groupOf(actor));
+  }
 
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -95,12 +113,12 @@ export class OfflineClient {
 
   /** Lecture : réseau d'abord, appareil ensuite. */
   async read<T>(actor: Actor, key: string, fetcher: () => Promise<T>): Promise<T> {
-    const cacheKey = `${actor.personId}:${key}`;
+    const cacheKey = `${groupOf(actor)}:${key}`;
     if (this.mayTry) {
       try {
         const data = await fetcher();
         this.reachable();
-        await this.cache.save(cacheKey, data, new Date());
+        await this.cache.saveIn(groupOf(actor), cacheKey, data, new Date());
         if (this.status.servedFromCacheAt) this.update({ servedFromCacheAt: undefined });
         return data;
       } catch (error) {
@@ -154,19 +172,20 @@ export class OfflineClient {
   }
 
   async sync(): Promise<void> {
-    if (!this.mayTry || this.status.syncing) return;
+    const session = this.session;
+    if (!this.mayTry || this.status.syncing || !session?.spaceId) return;
     this.update({ syncing: true });
     try {
       const changed = await this.outbox.flush(async (operation) => {
         try {
           // Le citoyen est le seul à payer hors ligne : son espace s'ouvre sur tout appareil.
-          const payment = await this.base.pay({ personId: operation.personId, channel: 'phone' }, operation.spaceId, operation.payload as PaymentInput, operation.id);
+          const payment = await this.base.pay({ personId: operation.personId, channel: 'phone', spaceId: operation.spaceId }, operation.spaceId, operation.payload as PaymentInput, operation.id);
           return { outcome: 'sent', detail: payment.status };
         } catch (error) {
           if (error instanceof ClientError && error.code === NETWORK_ERROR) return { outcome: 'offline' };
           return { outcome: 'rejected', detail: (error as Error).message };
         }
-      }, new Date());
+      }, new Date(), (operation) => operation.personId === session.personId && operation.spaceId === session.spaceId);
       if (changed.length > 0) {
         this.update({
           lastSync: {
@@ -194,11 +213,19 @@ export class OfflineClient {
   }
 
   private async refreshPending() {
-    this.update({ pending: (await this.outbox.list()).filter((operation) => operation.status === 'pending') as PendingOperation<PaymentInput>[] });
+    const session = this.session;
+    this.update({
+      pending: (await this.outbox.list()).filter((operation) => operation.status === 'pending'
+        && operation.personId === session?.personId && operation.spaceId === session?.spaceId) as PendingOperation<PaymentInput>[],
+    });
   }
 
   private update(patch: Partial<OfflineStatus>) {
     this.status = { ...this.status, ...patch };
     for (const listener of this.listeners) listener();
   }
+}
+
+function groupOf(actor: Actor): string {
+  return `${actor.personId}@${actor.spaceId ?? '*'}`;
 }

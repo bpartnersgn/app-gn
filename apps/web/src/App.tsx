@@ -1,12 +1,23 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { CHANNEL_LABELS, CHANNELS, type Channel, type MeView, type Person, type SpaceAccess } from '@app-gn/core';
-import { createBaseClient, type CodeChallenge } from './client.ts';
+import { CHANNEL_LABELS, CHANNELS, spaceOpensOn, type Actor, type Channel, type MeView, type Person, type SpaceEntry } from '@app-gn/core';
+import { createBaseClient, type CodeChallenge, type OpenedSession, type SignInOutcome } from './client.ts';
 import { SessionContext, useOfflineStatus, useViewportChannel } from './context.ts';
-import { SPACE_KIND_LABELS, SPACE_KIND_SHORT, dateTime } from './format.ts';
+import { SPACE_KIND_SHORT, dateTime } from './format.ts';
 import { OfflineClient } from './offline.ts';
 import { SECTIONS, SpaceView, type Section } from './SpaceView.tsx';
 
 const client = new OfflineClient(createBaseClient());
+
+/**
+ * Ce que montre l'écran avant d'entrer dans un espace :
+ * - la connexion (NIN puis code) ;
+ * - le choix de l'espace, pour qui a aussi une entreprise ou une administration ;
+ * - la confirmation par un nouveau code, pour passer d'un espace à un autre.
+ */
+type Entry =
+  | { kind: 'signin' }
+  | { kind: 'choose'; spaces: SpaceEntry[]; pick: (spaceId: string) => Promise<void> }
+  | { kind: 'switch'; nin: string; target: SpaceEntry };
 
 export function App() {
   const viewport = useViewportChannel();
@@ -15,9 +26,9 @@ export function App() {
 
   const [persons, setPersons] = useState<Person[]>([]);
   const [profiles, setProfiles] = useState<Record<string, MeView>>({});
-  const [personId, setPersonId] = useState<string | null>(null);
+  const [opened, setOpened] = useState<OpenedSession | null>(null);
   const [me, setMe] = useState<MeView | null>(null);
-  const [spaceId, setSpaceId] = useState<string | null>(null);
+  const [entry, setEntry] = useState<Entry>({ kind: 'signin' });
   const [section, setSection] = useState<Section>('home');
   const [error, setError] = useState<string | null>(null);
 
@@ -31,42 +42,82 @@ export function App() {
     })().catch((cause) => setError(String(cause.message ?? cause)));
   }, []);
 
-  // Les espaces ouverts dépendent de l'appareil : on relit à chaque changement de format.
-  useEffect(() => {
-    if (!personId) return;
-    client.read({ personId, channel }, 'me', () => client.base.me({ personId, channel }))
-      .then((view) => {
-        setMe(view);
-        setSpaceId((current) => {
-          const still = view.spaces.find((access) => access.space.id === current && access.opensOnChannel);
-          if (still) return current;
-          const pro = view.spaces.find((access) => access.space.kind !== 'citizen' && access.opensOnChannel);
-          return (pro ?? view.spaces.find((access) => access.opensOnChannel))?.space.id ?? null;
-        });
-      })
-      .catch((cause) => setError((cause as Error).message));
-  }, [personId, channel]);
+  const actor: Actor | null = useMemo(() => (opened ? { personId: opened.personId, spaceId: opened.spaceId, channel } : null), [opened, channel]);
 
-  const session = useMemo(() => (personId ? { client, actor: { personId, channel } } : null), [personId, channel]);
+  useEffect(() => {
+    if (!actor) return;
+    client.read(actor, 'me', () => client.base.me(actor))
+      .then(setMe)
+      .catch((cause) => setError((cause as Error).message));
+  }, [actor]);
+
+  const session = useMemo(() => (actor ? { client, actor } : null), [actor]);
+
+  function enter(next: OpenedSession) {
+    setOpened(next);
+    setMe(null);
+    setSection('home');
+    setEntry({ kind: 'signin' });
+    client.setSession({ ...next, channel });
+  }
+
+  async function leave() {
+    if (actor && opened) {
+      await client.forget(actor);
+      await client.base.signOut(opened);
+    }
+    client.setSession(null);
+    setOpened(null);
+    setMe(null);
+  }
+
+  function chooseFrom(outcome: SignInOutcome) {
+    if (outcome.kind === 'session') return enter(outcome);
+    setEntry({
+      kind: 'choose',
+      spaces: outcome.spaces,
+      pick: async (spaceId) => enter(await client.base.selectSpace(outcome.selectionToken, spaceId)),
+    });
+  }
+
+  /** Accès rapide de démonstration : pas de code, mais le même choix d'espace. */
+  function pickPersona(personId: string) {
+    const spaces = (profiles[personId]?.spaces ?? []).map((access) => ({
+      id: access.space.id, kind: access.space.kind, name: access.space.name, opensOnChannel: access.opensOnChannel,
+    }));
+    if (spaces.length === 1) return enter({ personId, spaceId: spaces[0]!.id });
+    setEntry({ kind: 'choose', spaces, pick: async (spaceId) => enter({ personId, spaceId }) });
+  }
 
   if (error) return <main className="page"><p className="notice notice-bad">{error}</p></main>;
 
-  const deviceBar = (
-    <DeviceBar channel={channel} override={override} onOverride={setOverride} />
-  );
+  const deviceBar = <DeviceBar channel={channel} override={override} onOverride={setOverride} />;
 
-  if (!session || !me || !spaceId) {
+  if (!session || !me) {
     return (
       <div className="device" data-device={channel} data-forced={override !== 'auto'}>
         <div className="device-screen">
           {deviceBar}
-          <SignIn persons={persons} profiles={profiles} channel={channel} onPick={(id) => { setPersonId(id); setSection('home'); }} />
+          {entry.kind === 'choose' ? (
+            <SpaceChooser spaces={entry.spaces} channel={channel} onPick={entry.pick} onCancel={() => setEntry({ kind: 'signin' })} />
+          ) : (
+            <SignIn
+              key={entry.kind === 'switch' ? entry.target.id : 'signin'}
+              persons={entry.kind === 'switch' ? [] : persons}
+              profiles={profiles}
+              channel={channel}
+              switching={entry.kind === 'switch' ? entry : undefined}
+              onPick={pickPersona}
+              onOutcome={chooseFrom}
+              onCancelSwitch={() => setEntry({ kind: 'signin' })}
+            />
+          )}
         </div>
       </div>
     );
   }
 
-  const active = me.spaces.find((access) => access.space.id === spaceId)!;
+  const active = me.spaces[0]!;
   const kind = active.space.kind;
   const layout: 'app' | 'web' | 'dashboard' = kind !== 'citizen' ? 'dashboard' : channel === 'phone' ? 'app' : 'web';
   const sections = SECTIONS[kind];
@@ -84,30 +135,39 @@ export function App() {
             </div>
             <div className="who">
               <span className="who-name">{me.person.fullName}</span>
-              <button type="button" className="link" onClick={() => { void client.base.signOut(personId!); setPersonId(null); setMe(null); setSpaceId(null); }}>Se déconnecter</button>
+              <SpaceSwitcher me={me} channel={channel} onSwitch={async (target) => {
+                const nin = me.person.nin;
+                await leave();
+                setEntry({ kind: 'switch', nin, target });
+              }} />
+              <button type="button" className="link" onClick={() => void leave()}>Se déconnecter</button>
             </div>
           </header>
+          <div className="space-bar" data-kind={kind}>
+            <span className="space-bar-kind">{kind === 'citizen' ? 'Espace personnel' : SPACE_KIND_SHORT[kind]}</span>
+            <span className="space-bar-name">{kind === 'citizen' ? 'Mes comptes' : active.space.name}</span>
+            {kind !== 'citizen' && <span className="space-bar-role">{active.roleLabel}</span>}
+          </div>
           <OfflineBanner />
 
-          <nav className="spaces" aria-label="Espaces">
-            {me.spaces.map((access) => (
-              <SpaceTab key={access.space.id} access={access} active={access.space.id === spaceId}
-                onSelect={() => { setSpaceId(access.space.id); setSection('home'); }} />
-            ))}
-          </nav>
-
-          <div className="workspace">
-            {layout !== 'app' && (
-              <nav className={layout === 'dashboard' ? 'sidenav' : 'toptabs'} aria-label="Rubriques">
-                {sections.map((item) => (
-                  <button key={item.id} type="button" className="nav-item" aria-current={section === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}>
-                    {item.label}
-                  </button>
-                ))}
-              </nav>
-            )}
-            <SpaceView key={`${me.person.id}:${spaceId}`} access={active} section={section} onNavigate={setSection} />
-          </div>
+          {!active.opensOnChannel ? (
+            <main className="page">
+              <p className="notice notice-wait">Cet espace s’ouvre sur tablette ou ordinateur. Sur téléphone, seul votre espace personnel est disponible.</p>
+            </main>
+          ) : (
+            <div className="workspace">
+              {layout !== 'app' && (
+                <nav className={layout === 'dashboard' ? 'sidenav' : 'toptabs'} aria-label="Rubriques">
+                  {sections.map((item) => (
+                    <button key={item.id} type="button" className="nav-item" aria-current={section === item.id ? 'page' : undefined} onClick={() => setSection(item.id)}>
+                      {item.label}
+                    </button>
+                  ))}
+                </nav>
+              )}
+              <SpaceView key={`${me.person.id}:${active.space.id}`} access={active} section={section} onNavigate={setSection} />
+            </div>
+          )}
 
           {layout === 'app' && (
             <nav className="tabbar" aria-label="Rubriques">
@@ -126,6 +186,173 @@ export function App() {
         </div>
       </div>
     </SessionContext.Provider>
+  );
+}
+
+/** Passer à un autre espace : on quitte celui-ci, et l'autre demande un nouveau code. Absent pour qui n'a qu'un espace. */
+function SpaceSwitcher({ me, channel, onSwitch }: { me: MeView; channel: Channel; onSwitch: (target: SpaceEntry) => void }) {
+  const [open, setOpen] = useState(false);
+  if (me.otherSpaces.length === 0) return null;
+  return (
+    <div className="switcher">
+      <button type="button" className="link" aria-expanded={open} onClick={() => setOpen(!open)}>Changer d’espace</button>
+      {open && (
+        <ul className="switcher-menu" role="menu">
+          {me.otherSpaces.map((space) => {
+            const opens = spaceOpensOn(space.kind, channel);
+            return (
+              <li key={space.id} role="none">
+                <button type="button" role="menuitem" className="switcher-item" data-kind={space.kind} disabled={!opens} onClick={() => onSwitch(space)}>
+                  <span className="switcher-name">{spaceTitle(space)}</span>
+                  <span className="fine">{opens ? 'Nouveau code demandé' : 'Tablette ou ordinateur'}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function spaceTitle(space: SpaceEntry): string {
+  return space.kind === 'citizen' ? 'Mon espace personnel' : space.name;
+}
+
+function SpaceChooser({ spaces, channel, onPick, onCancel }: { spaces: SpaceEntry[]; channel: Channel; onPick: (spaceId: string) => Promise<void>; onCancel: () => void }) {
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <main className="signin">
+      <div className="signin-head">
+        <h1 className="chooser-title">Où voulez-vous entrer ?</h1>
+        <p className="lede">Vos fonds personnels et ceux de vos organisations ne s’affichent jamais ensemble. Pour passer de l’un à l’autre, vous confirmez avec un nouveau code.</p>
+      </div>
+      <ul className="persona-list">
+        {spaces.map((space) => {
+          const opens = spaceOpensOn(space.kind, channel);
+          return (
+            <li key={space.id}>
+              <button type="button" className="persona entrance" data-kind={space.kind} disabled={!opens}
+                onClick={() => onPick(space.id).catch((cause) => setError((cause as Error).message))}>
+                <span className="eyebrow">{space.kind === 'citizen' ? 'Personnel' : SPACE_KIND_SHORT[space.kind]}</span>
+                <span className="persona-name">{spaceTitle(space)}</span>
+                <span className="fine">
+                  {space.kind === 'citizen'
+                    ? 'Vos comptes, wallets, cartes et documents à vous'
+                    : opens ? 'Tableau de bord de l’organisation' : 'S’ouvre sur tablette ou ordinateur'}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {error && <p className="notice notice-bad">{error}</p>}
+      <button type="button" className="link" onClick={onCancel}>Annuler</button>
+    </main>
+  );
+}
+
+function SignIn({ persons, profiles, channel, switching, onPick, onOutcome, onCancelSwitch }: {
+  persons: Person[];
+  profiles: Record<string, MeView>;
+  channel: Channel;
+  switching?: { nin: string; target: SpaceEntry };
+  onPick: (personId: string) => void;
+  onOutcome: (outcome: SignInOutcome) => void;
+  onCancelSwitch: () => void;
+}) {
+  return (
+    <main className="signin">
+      <div className="signin-head">
+        <span className="brand-mark brand-mark-lg" aria-hidden="true">GN</span>
+        <h1>App GN</h1>
+        {switching
+          ? <p className="lede">Pour entrer dans <strong>{spaceTitle(switching.target)}</strong>, confirmez avec un nouveau code. L’espace que vous quittez a été fermé et effacé de cet appareil.</p>
+          : <p className="lede">Vos comptes, wallets, cartes, crypto et documents réunis, utilisables même sans réseau. Si vous gérez une entreprise ou une administration, elle a son propre espace, séparé du vôtre.</p>}
+      </div>
+      <NinSignIn presetNin={switching?.nin} spaceId={switching?.target.id} onOutcome={onOutcome} />
+      {switching && <button type="button" className="link" onClick={onCancelSwitch}>Annuler</button>}
+      {persons.length > 0 && <h2 className="eyebrow">Ou accès rapide (démo)</h2>}
+      <ul className="persona-list">
+        {persons.map((person) => {
+          const view = profiles[person.id];
+          return (
+            <li key={person.id}>
+              <button type="button" className="persona" onClick={() => onPick(person.id)}>
+                <span className="persona-name">{person.fullName}</span>
+                <span className="persona-nin">{person.nin}</span>
+                <span className="persona-spaces">
+                  {view?.spaces.map((access) => (
+                    <span key={access.space.id} className="chip" data-kind={access.space.kind} data-muted={channel === 'phone' && access.space.kind !== 'citizen'}>
+                      {access.space.kind === 'citizen' ? 'Personnel' : `${access.roleLabel} · ${access.space.name}`}
+                    </span>
+                  ))}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+      {persons.length > 0 && (
+        <p className="fine">
+          {channel === 'phone'
+            ? 'Sur téléphone, seul l’espace personnel s’ouvre. Les espaces entreprise et administration demandent une tablette ou un ordinateur.'
+            : 'Chaque espace s’ouvre seul : l’espace personnel en version web, une entreprise ou une administration en tableau de bord.'}
+        </p>
+      )}
+    </main>
+  );
+}
+
+/** Connexion par NIN : le code arrive par SMS (montré ici en démonstration, aucun SMS n'étant branché). */
+function NinSignIn({ presetNin, spaceId, onOutcome }: { presetNin?: string; spaceId?: string; onOutcome: (outcome: SignInOutcome) => void }) {
+  const [nin, setNin] = useState(presetNin ?? '');
+  const [code, setCode] = useState('');
+  const [challenge, setChallenge] = useState<CodeChallenge | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      if (!challenge) {
+        setChallenge(await client.base.requestCode(nin));
+      } else {
+        onOutcome(await client.base.openSession(challenge.challengeId, code, spaceId));
+      }
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="panel nin-form" onSubmit={submit} aria-labelledby="nin-title">
+      <h2 id="nin-title" className="panel-title">{presetNin ? 'Confirmer avec un code' : 'Se connecter avec mon NIN'}</h2>
+      {!challenge ? (
+        <label className="field">
+          <span>Numéro d’identification nationale</span>
+          <input id="nin" className="mono" value={nin} onChange={(event) => setNin(event.target.value)} placeholder="GN-NIN-…" autoComplete="username" readOnly={Boolean(presetNin)} required />
+        </label>
+      ) : (
+        <>
+          <p className="fine">Si ce NIN est enregistré, un code à 6 chiffres vient d’être envoyé par SMS au numéro associé. Il expire dans 5 minutes.</p>
+          {challenge.demoCode && <p className="notice notice-wait">Démo, aucun SMS envoyé : votre code est <strong className="mono">{challenge.demoCode}</strong></p>}
+          <label className="field">
+            <span>Code reçu par SMS</span>
+            <input id="otp" className="mono" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} required />
+          </label>
+        </>
+      )}
+      {error && <p className="notice notice-bad">{error}</p>}
+      <div className="nin-actions">
+        <button type="submit" className="btn btn-primary" disabled={busy}>{challenge ? 'Se connecter' : 'Recevoir un code'}</button>
+        {challenge && !presetNin && <button type="button" className="link" onClick={() => { setChallenge(null); setCode(''); setError(null); }}>Changer de NIN</button>}
+      </div>
+    </form>
   );
 }
 
@@ -179,114 +406,6 @@ function OfflineBanner() {
   );
 }
 
-function SpaceTab({ access, active, onSelect }: { access: SpaceAccess; active: boolean; onSelect: () => void }) {
-  return (
-    <button type="button" className="space-tab" data-kind={access.space.kind} aria-pressed={active} disabled={!access.opensOnChannel} onClick={onSelect}
-      title={access.opensOnChannel ? SPACE_KIND_LABELS[access.space.kind] : 'S’ouvre sur tablette ou ordinateur'}>
-      <span className="space-tab-kind">{SPACE_KIND_SHORT[access.space.kind]}</span>
-      <span className="space-tab-name">{access.space.kind === 'citizen' ? 'Mon espace' : access.space.name}</span>
-      <span className="space-tab-role">{access.opensOnChannel ? access.roleLabel : 'Tablette ou ordinateur'}</span>
-    </button>
-  );
-}
-
-function SignIn({ persons, profiles, channel, onPick }: {
-  persons: Person[];
-  profiles: Record<string, MeView>;
-  channel: Channel;
-  onPick: (personId: string) => void;
-}) {
-  return (
-    <main className="signin">
-      <div className="signin-head">
-        <span className="brand-mark brand-mark-lg" aria-hidden="true">GN</span>
-        <h1>App GN</h1>
-        <p className="lede">Une seule application pour le citoyen, l’entreprise et l’administration. Comptes, wallets, cartes, crypto et documents réunis, utilisables même sans réseau.</p>
-      </div>
-      <NinSignIn onSignedIn={onPick} />
-      {persons.length > 0 && <h2 className="eyebrow">Ou accès rapide (démo)</h2>}
-      <ul className="persona-list">
-        {persons.map((person) => {
-          const view = profiles[person.id];
-          return (
-            <li key={person.id}>
-              <button type="button" className="persona" onClick={() => onPick(person.id)}>
-                <span className="persona-name">{person.fullName}</span>
-                <span className="persona-nin">{person.nin}</span>
-                <span className="persona-spaces">
-                  {view?.spaces.map((access) => (
-                    <span key={access.space.id} className="chip" data-kind={access.space.kind} data-muted={channel === 'phone' && access.space.kind !== 'citizen'}>
-                      {access.space.kind === 'citizen' ? 'Citoyen' : `${access.roleLabel} · ${access.space.name}`}
-                    </span>
-                  ))}
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-      <p className="fine">
-        {channel === 'phone'
-          ? 'Sur téléphone, seule l’application citoyenne s’ouvre. Les espaces entreprise et administration demandent une tablette ou un ordinateur.'
-          : 'Les espaces entreprise et administration s’ouvrent en tableau de bord ; l’espace citoyen, en version web.'}
-      </p>
-    </main>
-  );
-}
-
-/** Connexion par NIN : le code arrive par SMS (montré ici en démonstration, aucun SMS n'étant branché). */
-function NinSignIn({ onSignedIn }: { onSignedIn: (personId: string) => void }) {
-  const [nin, setNin] = useState('');
-  const [code, setCode] = useState('');
-  const [challenge, setChallenge] = useState<CodeChallenge | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setError(null);
-    setBusy(true);
-    try {
-      if (!challenge) {
-        setChallenge(await client.base.requestCode(nin));
-      } else {
-        const { personId } = await client.base.openSession(challenge.challengeId, code);
-        onSignedIn(personId);
-      }
-    } catch (cause) {
-      setError((cause as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <form className="panel nin-form" onSubmit={submit} aria-labelledby="nin-title">
-      <h2 id="nin-title" className="panel-title">Se connecter avec mon NIN</h2>
-      {!challenge ? (
-        <label className="field">
-          <span>Numéro d’identification nationale</span>
-          <input id="nin" className="mono" value={nin} onChange={(event) => setNin(event.target.value)} placeholder="GN-NIN-…" autoComplete="username" required />
-        </label>
-      ) : (
-        <>
-          <p className="fine">Si ce NIN est enregistré, un code à 6 chiffres vient d’être envoyé par SMS au numéro associé. Il expire dans 5 minutes.</p>
-          {challenge.demoCode && <p className="notice notice-wait">Démo, aucun SMS envoyé : votre code est <strong className="mono">{challenge.demoCode}</strong></p>}
-          <label className="field">
-            <span>Code reçu par SMS</span>
-            <input id="otp" className="mono" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, ''))} required />
-          </label>
-        </>
-      )}
-      {error && <p className="notice notice-bad">{error}</p>}
-      <div className="nin-actions">
-        <button type="submit" className="btn btn-primary" disabled={busy}>{challenge ? 'Se connecter' : 'Recevoir un code'}</button>
-        {challenge && <button type="button" className="link" onClick={() => { setChallenge(null); setCode(''); setError(null); }}>Changer de NIN</button>}
-      </div>
-    </form>
-  );
-}
-
 function TabIcon({ section }: { section: Section }) {
   const paths: Record<Section, string> = {
     home: 'M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z',
@@ -301,4 +420,3 @@ function TabIcon({ section }: { section: Section }) {
     </svg>
   );
 }
-

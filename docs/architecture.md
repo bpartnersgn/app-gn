@@ -12,7 +12,7 @@ Une seule application, trois profils, chacun sur ses canaux :
 | Entreprise | micro-entrepreneur, PME, ETI | GAPP | tableau de bord web, sur ordinateur ou tablette uniquement |
 | Administration | collectivité, EPA, agence, entreprise publique | GAPP Institutionnel | tableau de bord web, sur ordinateur ou tablette uniquement |
 
-Une personne a **une seule identité** et agit dans **plusieurs espaces** : son espace citoyen, et ceux des entreprises ou administrations dont elle est membre, avec un rôle dans chacun. Passer de citoyen à pro, c'est ouvrir un espace de plus, pas créer un autre compte.
+Une personne a **une seule identité** et un **espace personnel**. La plupart n'ont que celui-là. Celles qui gèrent aussi une entreprise ou une administration y ont un espace de plus, avec un rôle, **séparé du leur** : une session ne s'ouvre que dans un espace à la fois, et les fonds personnels ne s'affichent jamais à côté de ceux d'une organisation (§4).
 
 Le cœur commun est un **agrégateur** (lire tous les comptes : banques, Mobile Money, carte virtuelle, wallet App GN, crypto) branché à un **orchestrateur de paiements** (ORCHEA / XeyLink Router, dépôt `orcheagn/-orchea-payment`), et des **services** qui s'en servent.
 
@@ -74,11 +74,17 @@ Matrice complète : `packages/core/src/rbac.ts`. Un espace dont on n'est pas mem
 - entreprise : au-delà de 5 000 000 GNF, une seconde personne habilitée approuve, sauf si l'initiateur est lui-même habilité (le dirigeant ; une confirmation forte par OTP viendra avec l'authentification réelle) ;
 - administration : toujours une seconde personne. L'ordonnateur mandate, le comptable public vise et paie. Celui qui initie ne peut jamais approuver.
 
+**Séparation des fonds** (exigence du 13/10/2026). Chaque session est liée à un seul espace : l'espace personnel, ou une entreprise, ou une administration.
+- Le noyau refuse toute lecture ou écriture hors de l'espace de la session (`not_a_member`, la même réponse qu'un espace inconnu) : depuis une session d'entreprise, ni soldes, ni mouvements, ni paiements, ni documents personnels ; et l'inverse. `me` ne rend que l'espace de la session, et nomme les autres (nom et nature, sans montant ni droit) pour pouvoir en changer.
+- Qui n'a que son espace personnel y entre directement : rien ne lui parle d'entreprise. Qui a aussi une organisation choisit l'espace après le code.
+- Changer d'espace ferme la session en cours, efface de l'appareil ce qui en était gardé pour le hors-ligne, et demande un nouveau code. Les paiements personnels en file restent sur l'appareil et ne partent qu'au retour dans l'espace personnel.
+- Il n'existe aucun total qui additionne fonds personnels et fonds d'une organisation.
+
 **Connexion** (`apps/api/src/auth.ts`) : NIN, puis code à 6 chiffres envoyé par SMS au numéro de la personne, puis session.
 - `POST /v1/auth/codes {nin}` → `202 {challengeId, expiresAt}`, identique que le NIN soit connu ou non (ni l'existence de la personne ni son numéro ne se devinent) ; au plus 3 codes par NIN en 15 minutes (`429`).
-- `POST /v1/auth/sessions {challengeId, code}` → `201 {token, expiresAt, me}`. Le code vit 5 minutes, se tente 5 fois, ne sert qu'une fois ; seule son empreinte est gardée.
-- Jeton `ags1.<charge>.<HMAC-SHA256>` (clé `APPGN_SESSION_SECRET`), valable 12 h, révocable par `DELETE /v1/auth/sessions/current`. L'application le garde sur l'appareil pour rester utilisable hors ligne.
-- Aucun fournisseur SMS n'est branché : en démonstration (`APPGN_DEMO_LOGIN`, ouverte par défaut), la réponse porte le code et l'accès rapide `Bearer demo:<personId>` reste ouvert ; `APPGN_DEMO_LOGIN=off` ferme les deux.
+- `POST /v1/auth/sessions {challengeId, code, spaceId?}` → `201 {token, expiresAt, me}` dans l'espace nommé, ou directement dans l'espace personnel pour qui n'a que lui ; sinon `200 {chooseSpace, selectionToken, spaces}`, puis `POST /v1/auth/sessions/space {selectionToken, spaceId}` (5 minutes, usage unique). Le code vit 5 minutes, se tente 5 fois, ne sert qu'une fois ; seule son empreinte est gardée.
+- Jeton `ags1.<charge>.<HMAC-SHA256>` (clé `APPGN_SESSION_SECRET`) qui porte la personne et l'espace, valable 12 h, révocable par `DELETE /v1/auth/sessions/current`. L'application le garde sur l'appareil pour rester utilisable hors ligne.
+- Aucun fournisseur SMS n'est branché : en démonstration (`APPGN_DEMO_LOGIN`, ouverte par défaut), la réponse porte le code et l'accès rapide `Bearer demo:<personId>@<spaceId>` (lié à l'espace comme une vraie session ; `demo:<personId>` sans espace sert aux essais de l'API) reste ouvert ; `APPGN_DEMO_LOGIN=off` ferme les deux.
 - Reste à faire : fournisseur SMS (agrégateur local ou opérateur), défis et révocations en base, appareil enregistré (qui fixera le format d'appareil au lieu de l'en-tête déclaré), confirmation forte par code des paiements au-delà du seuil, raccordement à l'identité numérique nationale quand elle offrira une API.
 
 ## 5. Agrégation des comptes

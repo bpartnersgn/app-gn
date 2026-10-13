@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
-import { AppError, normalizeNin, type AppGn } from '@app-gn/core';
+import { AppError, normalizeNin, type AppGn, type SpaceEntry } from '@app-gn/core';
 
 /**
  * Connexion par NIN + code à usage unique envoyé par SMS, puis session signée.
@@ -7,7 +7,11 @@ import { AppError, normalizeNin, type AppGn } from '@app-gn/core';
  * - Le code (6 chiffres) vit 5 minutes, se tente 5 fois au plus, ne sert qu'une fois ; seul son empreinte est gardée.
  * - Au plus 3 codes par personne en 15 minutes.
  * - La réponse est la même qu'un NIN soit connu ou non : elle ne dit ni si la personne existe, ni son numéro.
- * - La session est un jeton signé (HMAC-SHA256) de 12 h, révocable à la déconnexion.
+ * - La session est un jeton signé (HMAC-SHA256) de 12 h, révocable à la déconnexion, et liée à un seul espace :
+ *   l'espace personnel, ou une entreprise, ou une administration. Fonds personnels et fonds d'une organisation
+ *   ne se lisent jamais dans la même session ; changer d'espace demande un nouveau code.
+ * - Qui n'a que son espace personnel y entre directement. Qui a aussi une organisation choisit après le code
+ *   (jeton de choix, 5 minutes, usage unique), ou nomme l'espace dès la demande de session.
  *
  * Défis, demandes de code et révocations vivent dans un `AuthStore` : en mémoire, ou en base (`db/postgres-store.ts`),
  * qui les garde d'un redémarrage à l'autre et les partage entre instances.
@@ -96,9 +100,15 @@ export interface AuthOptions {
 
 export interface Session {
   personId: string;
+  /** L'espace de la session : rien d'autre n'y est lisible. */
+  spaceId: string;
   sessionId: string;
   expiresAt: string;
 }
+
+export type SignInResult =
+  | { kind: 'session'; token: string; session: Session }
+  | { kind: 'choose_space'; selectionToken: string; spaces: SpaceEntry[] };
 
 export class Auth {
   private readonly app: AppGn;
@@ -142,8 +152,8 @@ export class Auth {
     return { challengeId, expiresAt: new Date(expiresAt).toISOString(), ...(this.revealCodes ? { demoCode: code } : {}) };
   }
 
-  /** Étape 2 : échanger le code contre une session. */
-  async verifyCode(challengeId: unknown, code: unknown): Promise<{ token: string; session: Session }> {
+  /** Étape 2 : échanger le code contre une session dans un espace, ou contre le choix de l'espace. */
+  async verifyCode(challengeId: unknown, code: unknown, spaceId?: unknown): Promise<SignInResult> {
     const refused = new AppError('unauthenticated', 'code incorrect ou expiré');
     if (typeof challengeId !== 'string' || typeof code !== 'string' || challengeId.length > 64) throw refused;
     const challenge = await this.store.countAttempt(challengeId);
@@ -154,13 +164,36 @@ export class Auth {
     }
     const ok = challenge.personId !== undefined && challenge.codeHash !== undefined && /^\d{6}$/.test(code)
       && safeEqual(this.hashCode(challengeId, code), challenge.codeHash);
-    if (!ok || !await this.store.consumeChallenge(challengeId)) throw refused;
-    return this.issue(challenge.personId!);
+    if (!ok) throw refused;
+    const personId = challenge.personId!;
+    const spaces = this.app.entrances(personId, 'desktop');
+    // L'espace demandé se vérifie avant de consommer le code : une erreur de choix ne coûte pas un nouveau SMS.
+    if (spaceId !== undefined && !spaces.some((space) => space.id === spaceId)) throw new AppError('not_a_member', 'espace inaccessible');
+    if (!await this.store.consumeChallenge(challengeId)) throw refused;
+    if (typeof spaceId === 'string') return { kind: 'session', ...this.issue(personId, spaceId) };
+    if (spaces.length === 1) return { kind: 'session', ...this.issue(personId, spaces[0]!.id) };
+    const selectionToken = randomUUID();
+    await this.store.saveChallenge(selectionToken, { personId, expiresAt: this.now() + CODE_TTL_MS, attempts: 0 });
+    return { kind: 'choose_space', selectionToken, spaces };
   }
 
-  issue(personId: string): { token: string; session: Session } {
-    const session: Session = { personId, sessionId: randomUUID(), expiresAt: new Date(this.now() + SESSION_TTL_MS).toISOString() };
-    const payload = Buffer.from(JSON.stringify({ sub: personId, sid: session.sessionId, exp: Date.parse(session.expiresAt) })).toString('base64url');
+  /** Étape 3, pour qui a plusieurs espaces : entrer dans celui choisi. */
+  async selectSpace(selectionToken: unknown, spaceId: unknown): Promise<{ token: string; session: Session }> {
+    const refused = new AppError('unauthenticated', 'choix expiré : reconnectez-vous');
+    if (typeof selectionToken !== 'string' || selectionToken.length > 64 || typeof spaceId !== 'string') throw refused;
+    const selection = await this.store.countAttempt(selectionToken);
+    // Un défi de code (qui porte une empreinte) n'est pas un jeton de choix.
+    if (!selection?.personId || selection.codeHash !== undefined || selection.expiresAt <= this.now() || selection.attempts > MAX_ATTEMPTS) throw refused;
+    if (!this.app.entrances(selection.personId, 'desktop').some((space) => space.id === spaceId)) {
+      throw new AppError('not_a_member', 'espace inaccessible');
+    }
+    if (!await this.store.consumeChallenge(selectionToken)) throw refused;
+    return this.issue(selection.personId, spaceId);
+  }
+
+  issue(personId: string, spaceId: string): { token: string; session: Session } {
+    const session: Session = { personId, spaceId, sessionId: randomUUID(), expiresAt: new Date(this.now() + SESSION_TTL_MS).toISOString() };
+    const payload = Buffer.from(JSON.stringify({ sub: personId, spc: spaceId, sid: session.sessionId, exp: Date.parse(session.expiresAt) })).toString('base64url');
     return { token: `ags1.${payload}.${this.sign(payload)}`, session };
   }
 
@@ -170,10 +203,10 @@ export class Auth {
     if (version !== 'ags1' || !payload || !signature || extra !== undefined) return undefined;
     if (!safeEqual(signature, this.sign(payload))) return undefined;
     try {
-      const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: unknown; sid?: unknown; exp?: unknown };
-      if (typeof claims.sub !== 'string' || typeof claims.sid !== 'string' || typeof claims.exp !== 'number') return undefined;
+      const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: unknown; spc?: unknown; sid?: unknown; exp?: unknown };
+      if (typeof claims.sub !== 'string' || typeof claims.spc !== 'string' || typeof claims.sid !== 'string' || typeof claims.exp !== 'number') return undefined;
       if (claims.exp <= this.now() || await this.store.isRevoked(claims.sid)) return undefined;
-      return { personId: claims.sub, sessionId: claims.sid, expiresAt: new Date(claims.exp).toISOString() };
+      return { personId: claims.sub, spaceId: claims.spc, sessionId: claims.sid, expiresAt: new Date(claims.exp).toISOString() };
     } catch {
       return undefined;
     }

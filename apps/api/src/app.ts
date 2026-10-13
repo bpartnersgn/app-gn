@@ -1,11 +1,12 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
-import type { Auth } from './auth.ts';
+import type { Auth, Session } from './auth.ts';
 import type { OrcheaWebhookReceiver } from './orchea.ts';
-import { AppError, isChannel, type Actor, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type PaymentInput } from '@app-gn/core';
+import { AppError, isChannel, type Actor, type Channel, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type PaymentInput } from '@app-gn/core';
 
 /**
- * Identité : `Authorization: Bearer <jeton de session>` (connexion par NIN + code SMS, voir auth.ts) ;
- * et, tant que la démonstration est permise, `Bearer demo:<personId>`. Toutes les règles d'accès vivent
+ * Identité : `Authorization: Bearer <jeton de session>` (connexion par NIN + code SMS, voir auth.ts), liée à un
+ * seul espace ; et, tant que la démonstration est permise, `Bearer demo:<personId>@<spaceId>` (liée de même) ou
+ * `Bearer demo:<personId>` (tous ses espaces, pour les essais de l'API). Toutes les règles d'accès vivent
  * dans la couche application (@app-gn/core) : seule la façon d'établir la personne change.
  *
  * Le format d'appareil est déclaré par le client (`AppGN-Channel: phone | tablet | desktop`, `phone` par défaut,
@@ -14,12 +15,18 @@ import { AppError, isChannel, type Actor, type AppGn, type CardNetwork, type Car
 async function resolveActor(request: FastifyRequest, auth: Auth | undefined, allowDemo: boolean): Promise<Actor> {
   const header = request.headers.authorization ?? '';
   const bearer = /^Bearer (\S+)$/.exec(header)?.[1];
-  const demo = allowDemo ? /^demo:([\w-]+)$/.exec(bearer ?? '')?.[1] : undefined;
-  const personId = demo ?? (bearer && auth ? (await auth.read(bearer))?.personId : undefined);
+  const demo = allowDemo ? /^demo:([\w-]+)(?:@([\w-]+))?$/.exec(bearer ?? '') : null;
+  const session = !demo && bearer && auth ? await auth.read(bearer) : undefined;
+  const personId = demo?.[1] ?? session?.personId;
+  const spaceId = demo ? demo[2] : session?.spaceId;
   if (!personId) throw new AppError('unauthenticated', 'session absente ou expirée : connectez-vous');
+  return { personId, channel: channelOf(request), ...(spaceId ? { spaceId } : {}) };
+}
+
+function channelOf(request: FastifyRequest): Channel {
   const channel = request.headers['appgn-channel'] ?? 'phone';
   if (!isChannel(channel)) throw new AppError('invalid_request', 'AppGN-Channel : phone, tablet ou desktop');
-  return { personId, channel };
+  return channel;
 }
 
 function keyOf(request: FastifyRequest): string {
@@ -74,10 +81,15 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
   if (auth) {
     server.post<{ Body: { nin?: unknown } }>('/v1/auth/codes', async (request, reply) =>
       reply.status(202).send(await auth.requestCode(request.body?.nin)));
-    server.post<{ Body: { challengeId?: unknown; code?: unknown } }>('/v1/auth/sessions', async (request, reply) => {
-      const { token, session } = await auth.verifyCode(request.body?.challengeId, request.body?.code);
-      return reply.status(201).send({ token, expiresAt: session.expiresAt, me: app.me({ personId: session.personId, channel: 'phone' }) });
+    const opened = (request: FastifyRequest, reply: FastifyReply, { token, session }: { token: string; session: Session }) =>
+      reply.status(201).send({ token, expiresAt: session.expiresAt, me: app.me({ personId: session.personId, channel: channelOf(request), spaceId: session.spaceId }) });
+    server.post<{ Body: { challengeId?: unknown; code?: unknown; spaceId?: unknown } }>('/v1/auth/sessions', async (request, reply) => {
+      const result = await auth.verifyCode(request.body?.challengeId, request.body?.code, request.body?.spaceId);
+      if (result.kind === 'choose_space') return reply.status(200).send({ chooseSpace: true, selectionToken: result.selectionToken, spaces: result.spaces });
+      return opened(request, reply, result);
     });
+    server.post<{ Body: { selectionToken?: unknown; spaceId?: unknown } }>('/v1/auth/sessions/space', async (request, reply) =>
+      opened(request, reply, await auth.selectSpace(request.body?.selectionToken, request.body?.spaceId)));
     server.delete('/v1/auth/sessions/current', async (request, reply) => {
       const bearer = /^Bearer (\S+)$/.exec(request.headers.authorization ?? '')?.[1];
       const session = bearer ? await auth.read(bearer) : undefined;

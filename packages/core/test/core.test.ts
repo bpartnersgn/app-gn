@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { AppError, convert, createDemoApp, formatMoney, MemoryStore, money, Outbox, parseMajor, toReference, type Actor, type Channel } from '../src/index.ts';
+import { AppError, convert, createDemoApp, formatMoney, MemoryStore, money, Outbox, parseMajor, SnapshotCache, toReference, type Actor, type Channel } from '../src/index.ts';
 
 const fixedNow = () => new Date('2026-10-12T10:00:00Z');
 const A = (personId: string, channel: Channel = 'desktop'): Actor => ({ personId, channel });
@@ -60,6 +60,30 @@ describe('profils et accès', () => {
     assert.ok(!ordonnateur.includes('administration.approve'));
     assert.ok(comptable.includes('administration.approve'));
     assert.ok(!comptable.includes('administration.mandate'));
+  });
+});
+
+describe('fonds personnels et fonds d’organisation séparés', () => {
+  it('une session de l’espace personnel ne lit rien de l’entreprise, et l’inverse', async () => {
+    const { app } = createDemoApp({ aggregationTimeoutMs: 50 });
+    const personal: Actor = { personId: 'per_mariama', channel: 'desktop', spaceId: 'spc_cit_mariama' };
+    const business: Actor = { personId: 'per_mariama', channel: 'desktop', spaceId: 'spc_biz_couture' };
+    assert.ok(await app.overview(personal, 'spc_cit_mariama'));
+    await assert.rejects(app.overview(personal, 'spc_biz_couture'), { code: 'not_a_member' });
+    await assert.rejects(app.overview(business, 'spc_cit_mariama'), { code: 'not_a_member' });
+    await assert.rejects(app.listPayments(business, 'spc_cit_mariama'), { code: 'not_a_member' });
+    assert.throws(() => app.documents(business, 'spc_cit_mariama'), { code: 'not_a_member' });
+
+    const me = app.me(business);
+    assert.deepEqual(me.spaces.map((access) => access.space.id), ['spc_biz_couture']);
+    assert.deepEqual(me.otherSpaces.map((entry) => entry.id), ['spc_cit_mariama']);
+    assert.throws(() => app.me({ ...personal, spaceId: 'spc_biz_boke' }), { code: 'not_a_member' });
+  });
+
+  it('une personne sans entreprise n’a que son espace personnel', () => {
+    const { app } = createDemoApp();
+    assert.deepEqual(app.entrances('per_kadiatou', 'phone').map((entry) => entry.kind), ['citizen']);
+    assert.deepEqual(app.entrances('per_mariama', 'phone').map((entry) => [entry.kind, entry.opensOnChannel]), [['citizen', true], ['business', false]]);
   });
 });
 
@@ -283,6 +307,25 @@ describe('hors ligne', () => {
     }, new Date('2026-10-12T09:00:00Z'));
     assert.deepEqual(seen, ['k1', 'k2']);
     assert.deepEqual((await outbox.list()).map((p) => p.status), ['sent', 'pending', 'pending']);
+  });
+
+  it('ne rejoue que les paiements de l’espace ouvert ; oublie les lectures de l’espace quitté', async () => {
+    const store = new MemoryStore();
+    const outbox = new Outbox(store);
+    await outbox.enqueue(op('perso', '2026-10-12T08:00:00Z'));
+    await outbox.enqueue({ ...op('pro', '2026-10-12T08:01:00Z'), spaceId: 'spc_biz_couture' });
+    const seen: string[] = [];
+    await outbox.flush(async (pending) => { seen.push(pending.id); return { outcome: 'sent' }; }, new Date('2026-10-12T09:00:00Z'),
+      (pending) => pending.spaceId === 'spc_biz_couture');
+    assert.deepEqual(seen, ['pro']);
+    assert.deepEqual((await outbox.list()).map((p) => p.status), ['pending', 'sent']);
+
+    const cache = new SnapshotCache(store);
+    await cache.saveIn('per_mariama@spc_cit_mariama', 'a', { solde: 1 }, new Date());
+    await cache.saveIn('per_mariama@spc_biz_couture', 'b', { solde: 2 }, new Date());
+    await cache.forget('per_mariama@spc_cit_mariama');
+    assert.equal(await cache.load('a'), null);
+    assert.ok(await cache.load('b'));
   });
 
   it('expire un paiement resté plus de 24 h sans réseau, sans l\u2019envoyer', async () => {

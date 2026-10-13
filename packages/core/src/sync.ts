@@ -44,6 +44,24 @@ export class SnapshotCache {
     await this.store.set(this.prefix + key, JSON.stringify({ data, savedAt: at.toISOString() }));
   }
 
+  /** Oublie toutes les lectures gardées sous ce préfixe de clé (l'espace qu'on quitte), grâce à un index tenu à côté. */
+  async forget(group: string): Promise<void> {
+    const indexKey = `${this.prefix}index:${group}`;
+    const raw = await this.store.get(indexKey);
+    const keys: string[] = raw ? safeParse(raw) : [];
+    for (const key of keys) await this.store.delete(this.prefix + key);
+    await this.store.delete(indexKey);
+  }
+
+  /** Comme `save`, en inscrivant la clé dans l'index de son groupe pour pouvoir l'oublier ensuite. */
+  async saveIn<T>(group: string, key: string, data: T, at: Date): Promise<void> {
+    const indexKey = `${this.prefix}index:${group}`;
+    const raw = await this.store.get(indexKey);
+    const keys: string[] = raw ? safeParse(raw) : [];
+    if (!keys.includes(key)) await this.store.set(indexKey, JSON.stringify([...keys, key]));
+    await this.save(key, data, at);
+  }
+
   async load<T>(key: string): Promise<Snapshot<T> | null> {
     const raw = await this.store.get(this.prefix + key);
     if (!raw) return null;
@@ -52,6 +70,15 @@ export class SnapshotCache {
     } catch {
       return null;
     }
+  }
+}
+
+function safeParse(raw: string): string[] {
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
   }
 }
 
@@ -116,11 +143,12 @@ export class Outbox {
    * Rejoue les opérations en attente, dans l'ordre de création. S'arrête à la première coupure :
    * l'ordre des débits voulu par la personne est respecté.
    */
-  async flush(replay: (operation: PendingOperation) => Promise<ReplayResult>, now: Date): Promise<PendingOperation[]> {
+  async flush(replay: (operation: PendingOperation) => Promise<ReplayResult>, now: Date, only: (operation: PendingOperation) => boolean = () => true): Promise<PendingOperation[]> {
     const all = await this.list();
     const changed: PendingOperation[] = [];
     for (const operation of all) {
-      if (operation.status !== 'pending') continue;
+      // Seules partent les opérations de l'espace ouvert : un paiement personnel en file attend la session personnelle.
+      if (operation.status !== 'pending' || !only(operation)) continue;
       if (Date.parse(operation.expiresAt) <= now.getTime()) {
         operation.status = 'expired';
         changed.push(operation);

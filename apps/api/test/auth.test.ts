@@ -15,25 +15,68 @@ function setup(options: { demoLogin?: boolean; revealCodes?: boolean } = {}) {
   return { server, sms, auth, advance: (ms: number) => { clock += ms; } };
 }
 
-async function signIn(context: ReturnType<typeof setup>, nin = 'GN-NIN-0000000001', phone = '+224 620 00 00 01') {
+async function signIn(context: ReturnType<typeof setup>, nin = 'GN-NIN-0000000001', phone = '+224 620 00 00 01', spaceId: string | null = 'spc_cit_mariama') {
   const asked = await context.server.inject({ method: 'POST', url: '/v1/auth/codes', payload: { nin } });
   assert.equal(asked.statusCode, 202);
   const code = context.sms.lastCodeFor(phone)!;
-  return context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId: asked.json().challengeId, code } });
+  return context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId: asked.json().challengeId, code, ...(spaceId ? { spaceId } : {}) } });
 }
 
 describe('connexion par NIN', () => {
-  it('NIN → code par SMS → session, puis accès à ses espaces seulement', async () => {
+  it('NIN → code par SMS → session dans l’espace personnel, qui ne voit rien de l’entreprise', async () => {
     const context = setup();
     const created = await signIn(context);
     assert.equal(created.statusCode, 201);
     const { token, me } = created.json();
     assert.match(token, /^ags1\./);
     assert.equal(me.person.fullName, 'Mariama Camara');
+    assert.deepEqual(me.spaces.map((access: { space: { id: string } }) => access.space.id), ['spc_cit_mariama']);
+    // L'autre espace est nommé pour pouvoir en changer, sans montant ni droit.
+    assert.deepEqual(me.otherSpaces, [{ id: 'spc_biz_couture', kind: 'business', name: 'Couture Mariama', opensOnChannel: false }]);
 
-    const headers = { authorization: `Bearer ${token}`, 'appgn-channel': 'phone' };
-    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/me', headers })).statusCode, 200);
-    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/spaces/spc_biz_boke/overview', headers })).statusCode, 403);
+    const headers = { authorization: `Bearer ${token}`, 'appgn-channel': 'desktop' };
+    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/spaces/spc_cit_mariama/overview', headers })).statusCode, 200);
+    for (const url of ['/v1/spaces/spc_biz_couture/overview', '/v1/spaces/spc_biz_couture/payments', '/v1/spaces/spc_biz_couture/accounts/acc_cm_om/transactions', '/v1/spaces/spc_biz_boke/overview']) {
+      const refused = await context.server.inject({ method: 'GET', url, headers });
+      assert.equal(refused.statusCode, 403, url);
+      assert.equal(refused.json().error, 'not_a_member');
+    }
+  });
+
+  it('session d’entreprise : les fonds personnels de la dirigeante n’y sont pas lisibles', async () => {
+    const context = setup();
+    const { token, me } = (await signIn(context, undefined, undefined, 'spc_biz_couture')).json();
+    assert.deepEqual(me.spaces.map((access: { space: { id: string } }) => access.space.id), ['spc_biz_couture']);
+    const headers = { authorization: `Bearer ${token}`, 'appgn-channel': 'desktop' };
+    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/spaces/spc_biz_couture/overview', headers })).statusCode, 200);
+    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/spaces/spc_cit_mariama/overview', headers })).statusCode, 403);
+    const paying = await context.server.inject({
+      method: 'POST', url: '/v1/spaces/spc_cit_mariama/payments', headers: { ...headers, 'idempotency-key': 'x-1' },
+      payload: { sourceAccountId: 'acc_mc_om', amount: '1000', destination: { type: 'own_account', accountId: 'acc_mc_mtn' } },
+    });
+    assert.equal(paying.statusCode, 403);
+  });
+
+  it('avec plusieurs espaces, on choisit après le code ; le choix ne sert qu’une fois', async () => {
+    const context = setup();
+    const choice = await signIn(context, undefined, undefined, null);
+    assert.equal(choice.statusCode, 200);
+    const { selectionToken, spaces } = choice.json();
+    assert.deepEqual(spaces.map((space: { id: string }) => space.id), ['spc_cit_mariama', 'spc_biz_couture']);
+    assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions/space', payload: { selectionToken, spaceId: 'spc_biz_boke' } })).statusCode, 403);
+    const entered = await context.server.inject({ method: 'POST', url: '/v1/auth/sessions/space', payload: { selectionToken, spaceId: 'spc_biz_couture' } });
+    assert.equal(entered.statusCode, 201);
+    assert.equal(entered.json().me.spaces[0].space.id, 'spc_biz_couture');
+    assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions/space', payload: { selectionToken, spaceId: 'spc_cit_mariama' } })).statusCode, 401);
+  });
+
+  it('qui n’a que son espace personnel y entre directement, sans rien voir d’autre', async () => {
+    const context = setup();
+    const created = await signIn(context, 'GN-NIN-0000000006', '+224 625 00 00 06', null);
+    assert.equal(created.statusCode, 201);
+    const { me } = created.json();
+    assert.deepEqual(me.spaces.map((access: { space: { kind: string } }) => access.space.kind), ['citizen']);
+    assert.deepEqual(me.otherSpaces, []);
   });
 
   it('le SMS porte le code, la réponse non (hors démonstration)', async () => {
@@ -64,8 +107,8 @@ describe('connexion par NIN', () => {
     for (let attempt = 0; attempt < 4; attempt += 1) {
       assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId, code: wrong } })).statusCode, 401);
     }
-    assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId, code } })).statusCode, 201);
-    assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId, code } })).statusCode, 401);
+    assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId, code, spaceId: 'spc_cit_mariama' } })).statusCode, 201);
+    assert.equal((await context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId, code, spaceId: 'spc_cit_mariama' } })).statusCode, 401);
 
     const again = await context.server.inject({ method: 'POST', url: '/v1/auth/codes', payload: { nin: 'GN-NIN-0000000001' } });
     const fresh = context.sms.lastCodeFor('+224 620 00 00 01')!;
@@ -102,13 +145,15 @@ describe('connexion par NIN', () => {
     const { token } = (await signIn(context)).json();
     const headers = (value: string) => ({ authorization: `Bearer ${value}` });
     const [version, payload, signature] = token.split('.');
-    const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(payload, 'base64url').toString()), sub: 'per_alpha' })).toString('base64url');
-    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/me', headers: headers(`${version}.${forged}.${signature}`) })).statusCode, 401);
+    for (const change of [{ sub: 'per_alpha' }, { spc: 'spc_biz_couture' }]) {
+      const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(payload, 'base64url').toString()), ...change })).toString('base64url');
+      assert.equal((await context.server.inject({ method: 'GET', url: '/v1/me', headers: headers(`${version}.${forged}.${signature}`) })).statusCode, 401);
+    }
 
     assert.equal((await context.server.inject({ method: 'DELETE', url: '/v1/auth/sessions/current', headers: headers(token) })).statusCode, 204);
     assert.equal((await context.server.inject({ method: 'GET', url: '/v1/me', headers: headers(token) })).statusCode, 401);
 
-    const second = (await signIn(context, 'GN-NIN-0000000002', '+224 660 00 00 02')).json().token;
+    const second = (await signIn(context, 'GN-NIN-0000000002', '+224 660 00 00 02', 'spc_cit_alpha')).json().token;
     context.advance(SESSION_TTL_MS);
     assert.equal((await context.server.inject({ method: 'GET', url: '/v1/me', headers: headers(second) })).statusCode, 401);
   });

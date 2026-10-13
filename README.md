@@ -58,10 +58,10 @@ npm run dev:api
 
 Contre un ORCHEA partagé, ajouter `ORCHEA_MODE=test` avec une clé de test : rien ne bouge. Détails : `docs/architecture.md` §6.
 
-Utilisateurs de démo : Mariama Camara (citoyenne, dirigeante de Couture Mariama), Alpha Diallo (directeur financier de Boké Logistique), Sékou Condé (dirigeant de Boké Logistique), Fatoumata Bah (ordonnatrice, Commune de Kaloum), Ibrahima Sylla (comptable public, Commune de Kaloum).
+Utilisateurs de démo : Kadiatou Sow (citoyenne, sans entreprise), Mariama Camara (citoyenne, dirigeante de Couture Mariama), Alpha Diallo (directeur financier de Boké Logistique), Sékou Condé (dirigeant de Boké Logistique), Fatoumata Bah (ordonnatrice, Commune de Kaloum), Ibrahima Sylla (comptable public, Commune de Kaloum).
 
 ## API (v1)
-Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeId, code}` → `Authorization: Bearer <jeton>`. En démonstration, la réponse porte le code (aucun SMS n'est envoyé) et `Bearer demo:<personId>` reste accepté ; `APPGN_DEMO_LOGIN=off` ferme les deux. `APPGN_SESSION_SECRET` (32 caractères au moins) garde les sessions d'un redémarrage à l'autre. Format d'appareil : `AppGN-Channel: phone | tablet | desktop` (`phone` par défaut).
+Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeId, code, spaceId?}` (et, pour qui a plusieurs espaces sans en nommer un, `POST /v1/auth/sessions/space {selectionToken, spaceId}`) → `Authorization: Bearer <jeton>`. Une session vaut pour un seul espace : fonds personnels et fonds d'une organisation ne se lisent jamais ensemble. En démonstration, la réponse porte le code (aucun SMS n'est envoyé) et `Bearer demo:<personId>@<spaceId>` reste accepté ; `APPGN_DEMO_LOGIN=off` ferme les deux. `APPGN_SESSION_SECRET` (32 caractères au moins) garde les sessions d'un redémarrage à l'autre. Format d'appareil : `AppGN-Channel: phone | tablet | desktop` (`phone` par défaut).
 
 | Méthode | Chemin | |
 |---|---|---|

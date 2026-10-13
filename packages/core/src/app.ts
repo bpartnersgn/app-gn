@@ -46,7 +46,17 @@ export interface SpaceAccess {
 
 export interface MeView {
   person: Person;
+  /** Avec une session liée à un espace : celui-là seul. */
   spaces: SpaceAccess[];
+  /** Les autres espaces de la personne, pour en changer : nom et nature seulement, aucun montant ni droit. */
+  otherSpaces: SpaceEntry[];
+}
+
+export interface SpaceEntry {
+  id: string;
+  kind: Space['kind'];
+  name: string;
+  opensOnChannel: boolean;
 }
 
 export interface PaymentInput {
@@ -141,8 +151,13 @@ export class AppGn {
 
   me(actor: Actor): MeView {
     const person = this.person(actor.personId);
-    const spaces = this.deps.memberships
-      .filter((membership) => membership.personId === actor.personId)
+    const memberships = this.deps.memberships.filter((membership) => membership.personId === actor.personId);
+    if (actor.spaceId && !memberships.some((membership) => membership.spaceId === actor.spaceId)) {
+      throw new AppError('not_a_member', 'espace inaccessible');
+    }
+    const otherSpaces = this.entrances(actor.personId, actor.channel).filter((entry) => actor.spaceId && entry.id !== actor.spaceId);
+    const spaces = memberships
+      .filter((membership) => !actor.spaceId || membership.spaceId === actor.spaceId)
       .map((membership) => {
         const space = this.deps.spaces.find((candidate) => candidate.id === membership.spaceId);
         if (!space) throw new Error(`espace ${membership.spaceId} introuvable`);
@@ -154,7 +169,17 @@ export class AppGn {
           opensOnChannel: spaceOpensOn(space.kind, actor.channel),
         };
       });
-    return { person, spaces };
+    return { person, spaces, otherSpaces };
+  }
+
+  /** Les espaces où la personne peut ouvrir une session : son espace personnel d'abord, puis ses organisations. */
+  entrances(personId: string, channel: Actor['channel']): SpaceEntry[] {
+    return this.deps.memberships
+      .filter((membership) => membership.personId === personId)
+      .map((membership) => this.deps.spaces.find((space) => space.id === membership.spaceId))
+      .filter((space): space is Space => Boolean(space))
+      .sort((a, b) => Number(a.kind !== 'citizen') - Number(b.kind !== 'citizen'))
+      .map((space) => ({ id: space.id, kind: space.kind, name: space.name, opensOnChannel: spaceOpensOn(space.kind, channel) }));
   }
 
   async overview(actor: Actor, spaceId: string): Promise<ConsolidatedView> {
@@ -533,6 +558,9 @@ export class AppGn {
 
   private access(actor: Actor, spaceId: string): { space: Space; role: Role } {
     this.person(actor.personId);
+    // Session liée à un autre espace : même réponse qu'un espace inconnu. Les fonds personnels ne se lisent
+    // pas depuis une session d'entreprise ou d'administration, ni l'inverse.
+    if (actor.spaceId && actor.spaceId !== spaceId) throw new AppError('not_a_member', 'espace inaccessible');
     const membership = this.deps.memberships.find((candidate) => candidate.personId === actor.personId && candidate.spaceId === spaceId);
     const space = this.deps.spaces.find((candidate) => candidate.id === spaceId);
     // Même réponse qu'il n'existe pas ou qu'on n'en soit pas membre : on ne révèle pas l'existence d'un espace.

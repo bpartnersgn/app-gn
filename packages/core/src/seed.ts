@@ -18,6 +18,8 @@ export const DEMO_PERSONS: Person[] = [
   { id: 'per_fatoumata', nin: 'GN-NIN-0000000003', fullName: 'Fatoumata Bah', phone: '+224 621 00 00 03' },
   { id: 'per_ibrahima', nin: 'GN-NIN-0000000004', fullName: 'Ibrahima Sylla', phone: '+224 664 00 00 04' },
   { id: 'per_sekou', nin: 'GN-NIN-0000000005', fullName: 'Sékou Condé', phone: '+224 622 00 00 05' },
+  // Le cas le plus courant : une personne qui n'a que son espace personnel.
+  { id: 'per_kadiatou', nin: 'GN-NIN-0000000006', fullName: 'Kadiatou Sow', phone: '+224 625 00 00 06' },
 ];
 
 export const DEMO_SPACES: Space[] = [
@@ -26,6 +28,7 @@ export const DEMO_SPACES: Space[] = [
   { id: 'spc_cit_fatoumata', kind: 'citizen', name: 'Fatoumata Bah', ownerPersonId: 'per_fatoumata' },
   { id: 'spc_cit_ibrahima', kind: 'citizen', name: 'Ibrahima Sylla', ownerPersonId: 'per_ibrahima' },
   { id: 'spc_cit_sekou', kind: 'citizen', name: 'Sékou Condé', ownerPersonId: 'per_sekou' },
+  { id: 'spc_cit_kadiatou', kind: 'citizen', name: 'Kadiatou Sow', ownerPersonId: 'per_kadiatou' },
   { id: 'spc_biz_couture', kind: 'business', name: 'Couture Mariama', legalForm: 'SARLU', rccm: 'GN.TCC.2025.A.00001', nif: '000000001' },
   { id: 'spc_biz_boke', kind: 'business', name: 'Boké Logistique', legalForm: 'SA', rccm: 'GN.TCC.2019.B.00002', nif: '000000002' },
   { id: 'spc_adm_kaloum', kind: 'administration', name: 'Commune de Kaloum', entityType: 'collectivite' },
@@ -42,6 +45,7 @@ export const DEMO_MEMBERSHIPS: Membership[] = [
   { personId: 'per_fatoumata', spaceId: 'spc_adm_kaloum', role: 'admin_authorizing_officer' },
   { personId: 'per_ibrahima', spaceId: 'spc_cit_ibrahima', role: 'citizen' },
   { personId: 'per_ibrahima', spaceId: 'spc_adm_kaloum', role: 'admin_public_accountant' },
+  { personId: 'per_kadiatou', spaceId: 'spc_cit_kadiatou', role: 'citizen' },
 ];
 
 interface AccountSeed {
@@ -70,6 +74,10 @@ const ACCOUNT_SEEDS: AccountSeed[] = [
   // Alpha, citoyen
   { id: 'acc_ad_om', spaceId: 'spc_cit_alpha', providerId: 'orange_money', label: 'Orange Money', currency: 'GNF', masked: '•••• 00 02', balance: 980_000, movement: 120_000, counterparties: ['Pharmacie', 'SEG', 'Recharge'] },
   { id: 'acc_ad_uba', spaceId: 'spc_cit_alpha', providerId: 'uba', label: 'Compte épargne', currency: 'GNF', masked: 'GN•• •••• 1093', balance: 14_500_000, movement: 1_500_000, counterparties: ['Virement salaire', 'Épargne'] },
+
+  // Kadiatou, citoyenne sans entreprise
+  { id: 'acc_ks_om', spaceId: 'spc_cit_kadiatou', providerId: 'orange_money', label: 'Orange Money', currency: 'GNF', masked: '•••• 00 06', balance: 615_000, movement: 80_000, counterparties: ['Marché Madina', 'Recharge', 'Aminata Sow'] },
+  { id: 'acc_ks_mtn', spaceId: 'spc_cit_kadiatou', providerId: 'mtn_momo', label: 'MTN MoMo', currency: 'GNF', masked: '•••• 00 16', balance: 190_000, movement: 30_000, counterparties: ['Taxi', 'Pharmacie'] },
 
   // Couture Mariama (micro-entreprise)
   { id: 'acc_cm_om', spaceId: 'spc_biz_couture', providerId: 'orange_money', label: 'Orange Money Pro', currency: 'GNF', masked: '•••• 10 01', balance: 3_200_000, movement: 250_000, counterparties: ['Cliente Aïssatou', 'Tissus Madina', 'Cliente Kadiatou'] },
@@ -176,4 +184,5 @@ export const DEMO_WALLET_NUMBERS: Readonly<Record<string, string>> = {
   acc_bl_om: '+224620002001',
   acc_bl_mtn: '+224660002002',
   acc_kal_om: '+224620003001',
+  acc_ks_om: '+224620000006',
 };

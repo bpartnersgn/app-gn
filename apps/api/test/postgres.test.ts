@@ -125,7 +125,7 @@ describe('PostgreSQL', () => {
 
     const { challengeId } = await one.requestCode('GN-NIN-0000000003');
     const code = sms.lastCodeFor('+224 621 00 00 03')!;
-    const attempts = await Promise.allSettled([one.verifyCode(challengeId, code), two.verifyCode(challengeId, code)]);
+    const attempts = await Promise.allSettled([one.verifyCode(challengeId, code, 'spc_cit_fatoumata'), two.verifyCode(challengeId, code, 'spc_cit_fatoumata')]);
     assert.equal(attempts.filter((attempt) => attempt.status === 'fulfilled').length, 1);
     const { token } = (attempts.find((attempt) => attempt.status === 'fulfilled') as PromiseFulfilledResult<{ token: string }>).value;
 

@@ -29,8 +29,15 @@ export function spaceOpensOn(kind: SpaceKind, channel: Channel): boolean {
   return SPACE_CHANNELS[kind].includes(channel);
 }
 
-/** Qui agit, et depuis quel format d'appareil. Chaque cas d'usage le reçoit. */
+/**
+ * Qui agit, depuis quel format d'appareil, et dans quel espace s'est ouverte sa session.
+ *
+ * `spaceId` sépare les fonds : une session ouverte dans l'espace personnel ne voit rien d'une entreprise ou
+ * d'une administration, et l'inverse. Changer d'espace, c'est ouvrir une autre session (nouveau code).
+ * Sans `spaceId` (tests, traitements internes), tous les espaces de la personne sont accessibles.
+ */
 export interface Actor {
   personId: string;
   channel: Channel;
+  spaceId?: string;
 }
