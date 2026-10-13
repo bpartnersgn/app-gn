@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import type { AppStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, VirtualCard } from '@app-gn/core';
+import type { AppStore, DeskCollection, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
 import type { AuthStore, Challenge } from '../auth.ts';
 import type { ProcessedEvents } from '../orchea.ts';
 
@@ -27,7 +27,7 @@ export async function migrate(sql: Sql): Promise<void> {
 
 type Json<T> = { document: T };
 
-export class PostgresStore implements AppStore, AuthStore, ProcessedEvents {
+export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore {
   private readonly sql: Sql;
   constructor(sql: Sql) {
     this.sql = sql;
@@ -179,5 +179,37 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents {
     await this.sql.query('DELETE FROM auth_challenges WHERE expires_at <= $1', [now]);
     await this.sql.query('DELETE FROM revoked_sessions WHERE until <= $1', [now]);
     await this.sql.query('DELETE FROM auth_code_requests WHERE requested_at < $1', [requestsBefore]);
+  }
+
+  // ── Bureaux GAPP ──
+
+  async get<T extends DeskEntity>(collection: DeskCollection, id: string): Promise<Versioned<T> | undefined> {
+    const { rows } = await this.sql.query<{ version: number; document: T }>('SELECT version, document FROM desk_records WHERE collection = $1 AND id = $2', [collection, id]);
+    const row = rows[0];
+    return row && { version: row.version, value: row.document };
+  }
+
+  async list<T extends DeskEntity>(collection: DeskCollection, spaceId: string): Promise<Versioned<T>[]> {
+    const { rows } = await this.sql.query<{ version: number; document: T }>(
+      'SELECT version, document FROM desk_records WHERE collection = $1 AND space_id = $2 ORDER BY seq',
+      [collection, spaceId],
+    );
+    return rows.map((row) => ({ version: row.version, value: row.document }));
+  }
+
+  async insert<T extends DeskEntity>(collection: DeskCollection, value: T): Promise<boolean> {
+    const { rows } = await this.sql.query(
+      'INSERT INTO desk_records (collection, id, space_id, version, document) VALUES ($1, $2, $3, 1, $4) ON CONFLICT (collection, id) DO NOTHING RETURNING id',
+      [collection, value.id, value.spaceId, JSON.stringify(value)],
+    );
+    return rows.length === 1;
+  }
+
+  async update<T extends DeskEntity>(collection: DeskCollection, value: T, expectedVersion: number): Promise<boolean> {
+    const { rows } = await this.sql.query(
+      'UPDATE desk_records SET version = version + 1, document = $3 WHERE collection = $1 AND id = $2 AND version = $4 RETURNING id',
+      [collection, value.id, JSON.stringify(value), expectedVersion],
+    );
+    return rows.length === 1;
   }
 }

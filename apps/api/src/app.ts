@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { Auth, Session } from './auth.ts';
+import { registerGappRoutes } from './gapp-routes.ts';
 import type { OrcheaWebhookReceiver } from './orchea.ts';
-import { AppError, isChannel, type Actor, type Channel, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type PaymentInput } from '@app-gn/core';
+import { AppError, isChannel, type Actor, type Channel, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type Gapp, type PaymentInput } from '@app-gn/core';
 
 /**
  * Identité : `Authorization: Bearer <jeton de session>` (connexion par NIN + code SMS, voir auth.ts), liée à un
@@ -41,6 +42,8 @@ export interface ServerOptions {
   auth?: Auth;
   /** Accepter `Bearer demo:<personId>` et la liste des personnes de démo. Par défaut : oui. */
   demoLogin?: boolean;
+  /** Tableaux de bord GAPP (entreprise, administration). */
+  gapp?: Gapp;
 }
 
 export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyInstance {
@@ -123,8 +126,8 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
   server.post<{ Params: { spaceId: string; paymentId: string } }>('/v1/spaces/:spaceId/payments/:paymentId/approve', async (request) =>
     app.approvePayment(await actorOf(request), request.params.spaceId, request.params.paymentId));
 
-  server.post<{ Params: { spaceId: string; paymentId: string } }>('/v1/spaces/:spaceId/payments/:paymentId/reject', async (request) =>
-    app.rejectPayment(await actorOf(request), request.params.spaceId, request.params.paymentId));
+  server.post<{ Params: { spaceId: string; paymentId: string }; Body: { reason?: string } | undefined }>('/v1/spaces/:spaceId/payments/:paymentId/reject', async (request) =>
+    app.rejectPayment(await actorOf(request), request.params.spaceId, request.params.paymentId, request.body?.reason));
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/documents', async (request) =>
     app.documents(await actorOf(request), request.params.spaceId));
@@ -153,6 +156,8 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
     const exchange = await app.executeExchange(await actorOf(request), request.params.spaceId, request.body?.quoteId ?? '', keyOf(request));
     return reply.status(201).send(exchange);
   });
+
+  if (options.gapp) registerGappRoutes(server, options.gapp, actorOf, keyOf);
 
   return server;
 }

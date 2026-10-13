@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
-import { loadDemoApp, type Actor } from '@app-gn/core';
+import { loadDemoApp, loadDemoGapp, type Actor } from '@app-gn/core';
 import { Auth, MemorySmsSender } from '../src/auth.ts';
 import { migrate, PostgresStore, type Sql } from '../src/db/postgres-store.ts';
 import { OrcheaWebhookReceiver, signOrcheaWebhook } from '../src/orchea.ts';
@@ -41,7 +41,7 @@ describe('PostgreSQL', () => {
   it('le schéma se rejoue sans erreur', async () => {
     await migrate(sql);
     const { rows } = await sql.query<{ version: number }>('SELECT version FROM schema_version');
-    assert.deepEqual(rows.map((row) => row.version), [1]);
+    assert.deepEqual(rows.map((row) => row.version), [1, 2]);
   });
 
   it('un paiement et sa clé d’idempotence survivent à un redémarrage', async () => {
@@ -138,5 +138,32 @@ describe('PostgreSQL', () => {
     await two.requestCode('GN-NIN-0000000004');
     await one.requestCode('GN-NIN-0000000004');
     await assert.rejects(two.requestCode('GN-NIN-0000000004'), { code: 'rate_limited' });
+  });
+});
+
+describe('PostgreSQL : bureaux GAPP', () => {
+  it('écriture conditionnelle : deux mises à jour sur la même version, une seule passe', async () => {
+    const record = { id: 'pg-desk-1', spaceId: 'spc_essai', n: 1 };
+    assert.equal(await store.insert('invoices', record), true);
+    assert.equal(await store.insert('invoices', record), false);
+    const results = await Promise.all([store.update('invoices', { ...record, n: 2 }, 1), store.update('invoices', { ...record, n: 3 }, 1)]);
+    assert.deepEqual(results.sort(), [false, true]);
+    assert.equal((await store.get('invoices', 'pg-desk-1'))?.version, 2);
+  });
+
+  it('les données de démonstration ne sont versées qu’une fois et survivent au redémarrage', async () => {
+    const sekou: Actor = { personId: 'per_sekou', channel: 'desktop', spaceId: 'spc_biz_boke' };
+    const first = (await loadDemoApp({ store })).app;
+    const gapp = await loadDemoGapp(first, { store });
+    const before = await gapp.business.invoices(sekou, 'spc_biz_boke');
+    assert.equal(before.chain.intact, true);
+    const restarted = (await loadDemoApp({ store })).app;
+    const again = await loadDemoGapp(restarted, { store });
+    const after = await again.business.invoices(sekou, 'spc_biz_boke');
+    assert.deepEqual(after.invoices.map((invoice) => invoice.number), before.invoices.map((invoice) => invoice.number));
+    assert.equal((await again.business.auditTrail(sekou, 'spc_biz_boke')).check.intact, true);
+    // L'attestation de Kadiatou est redéposée dans son coffre après le redémarrage.
+    const vault = restarted.documents({ personId: 'per_kadiatou', channel: 'phone', spaceId: 'spc_cit_kadiatou' }, 'spc_cit_kadiatou');
+    assert.ok(vault.some((document) => document.category === 'employment'));
   });
 });

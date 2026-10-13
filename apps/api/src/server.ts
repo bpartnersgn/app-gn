@@ -1,4 +1,4 @@
-import { DEMO_WALLET_NUMBERS, loadDemoApp, SimulatedOrchestrator } from '@app-gn/core';
+import { DEMO_WALLET_NUMBERS, loadDemoApp, loadDemoGapp, SimulatedOrchestrator } from '@app-gn/core';
 import { buildServer } from './app.ts';
 import { Auth, MemorySmsSender, sessionSecretFromEnvironment } from './auth.ts';
 import { databaseFromEnvironment } from './db/connect.ts';
@@ -24,6 +24,9 @@ const { app } = await loadDemoApp({
     : undefined,
 });
 
+// Tableaux de bord GAPP, dans la même base ; les données de démonstration n'y sont versées qu'une fois.
+const gapp = await loadDemoGapp(app, { store: database?.store });
+
 // Connexion par NIN + code SMS. Aucun fournisseur SMS n'est branché : en démonstration (APPGN_DEMO_LOGIN,
 // activée par défaut), la réponse porte le code ; APPGN_DEMO_LOGIN=off ferme la connexion de démo et le code affiché.
 const demoLogin = process.env.APPGN_DEMO_LOGIN !== 'off';
@@ -34,6 +37,7 @@ const server = buildServer(app, {
   logger: true,
   auth,
   demoLogin,
+  gapp,
   ...(orchea ? { orcheaWebhooks: new OrcheaWebhookReceiver(app, orchea.webhookSecrets, { processed: database?.store }) } : {}),
 });
 if (database) server.addHook('onClose', database.close);
