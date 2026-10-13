@@ -4,19 +4,21 @@ Une seule application pour le **citoyen** (application mobile ou web), l'**entre
 
 Les paiements passent par l'orchestrateur [ORCHEA](https://github.com/orcheagn/-orchea-payment) (XeyLink Router), dans son propre dépôt.
 
-**État : socle v0.2.0.** Données fictives et connecteurs simulés : aucun fournisseur réel n'est appelé, aucun argent ne bouge.
+**État : socle v0.4.0.** Données fictives et connecteurs simulés : aucun fournisseur réel n'est appelé, aucun argent ne bouge.
 
 ## Ce que fait le socle
-- Trois espaces dans la même application, un sélecteur pour passer de l'un à l'autre, un rôle par espace.
+- Trois espaces dans la même application, un rôle par espace, une session par espace : fonds personnels et fonds d'une organisation ne s'affichent jamais ensemble.
 - Vue consolidée de tous les comptes en GNF (contre-valeur indicative), résistante à la panne d'un fournisseur.
 - Paiements (facture, Mobile Money, entre comptes) avec idempotence et règles d'approbation par profil : seuil de 5 M GNF côté entreprise, séparation ordonnateur / comptable public côté administration.
 - Catalogue de services filtré par rôle (branchés et prévus).
 - Canaux : espace citoyen sur tout appareil (mise en page application sur téléphone), espaces pro en tableau de bord sur tablette ou ordinateur seulement.
 - Hors ligne d'abord : écrans servis depuis l'appareil, paiements du citoyen mis en file et rejoués sans double débit, expiration après 24 h ; application installable.
 - Coffre de documents : identité, permis, carte grise, assurances, abonnements, attestations d'entreprise ; alerte avant expiration ; vérification par code.
+- GAPP Entreprise : trésorerie et projection à 7 jours, factures numérotées et scellées, fournisseurs payés par lots avec approbation, TVA déclarée et payée à la DGI, équipe et paie, score B2B indicatif, journal SYSCOHADA. Chaque rubrique selon le rôle (dirigeant, DAF, comptable, RH).
+- GAPP Institutionnel : budget et exécution, chaîne engagement → liquidation → mandat → visa (ordonnateur et comptable public distincts), paie des agents contrôlée contre l'état civil, recettes, rapport Cour des comptes. Aucun paiement direct hors mandat.
 - Cartes virtuelles et conversions sur le modèle de Keecash : plusieurs cartes, blocage instantané, recharge depuis Mobile Money ou crypto avec devis (frais et cours) avant confirmation.
 
-Architecture : [docs/architecture.md](docs/architecture.md). Décisions : [ADR-001](docs/adr/adr-001-socle.md), [ADR-002](docs/adr/adr-002-canaux-hors-ligne-documents-cartes.md).
+Architecture : [docs/architecture.md](docs/architecture.md). Décisions : [docs/adr/](docs/adr/), dont [ADR-006](docs/adr/adr-006-un-espace-par-session.md) (un espace par session) et [ADR-007](docs/adr/adr-007-bureaux-gapp.md) (bureaux GAPP).
 
 ## Démarrer
 Node ≥ 22.18.
@@ -76,10 +78,12 @@ Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeI
 | GET/POST | `/v1/spaces/:spaceId/cards` | lister / émettre une carte virtuelle |
 | POST | `/v1/spaces/:spaceId/cards/:accountId/freeze` · `/unfreeze` | bloquer / débloquer |
 | POST | `/v1/spaces/:spaceId/exchange-quotes` puis `/exchanges` | devis puis conversion |
+| GET/POST | `/v1/spaces/:spaceId/business/…` | bureau Entreprise : `treasury`, `invoices`, `bills`, `batches`, `vat`, `team`, `payroll`, `score`, `audit`, `ledger/:period` |
+| GET/POST | `/v1/spaces/:spaceId/administration/…` | bureau Administration : `budget`, `engagements` (liquidations, mandat, visa, rejet), `agents`, `payroll-check/:period`, `payrolls`, `revenue`, `court-report`, `audit` |
 | POST | `/v1/webhooks/orchea` | issues de paiement envoyées par ORCHEA (signées ; seulement si `ORCHEA_*` est réglé) |
 
 ## Structure
-- `packages/core` — règles : profils et droits, agrégation, paiements, catalogue, montants
+- `packages/core` — règles : profils et droits, agrégation, paiements, catalogue, montants ; `gapp/` pour les bureaux Entreprise et Administration et leur table de routes
 - `apps/api` — API HTTP (Fastify), connexion (`auth.ts`), adaptateur ORCHEA (`orchea.ts`), base (`db/`)
 - `apps/web` — interface (React + Vite)
 - `docs/` — architecture et décisions

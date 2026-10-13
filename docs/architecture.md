@@ -1,6 +1,6 @@
 # App GN — architecture cible
 
-Écrit le 12/10/2026 avec le socle (v0.1.0), complété le même jour (v0.2.0 : canaux par profil, hors ligne d'abord, coffre de documents, cartes virtuelles et conversions ; v0.3.0 : paiements de factures par ORCHEA, connexion par NIN et code SMS, PostgreSQL). Ce document décrit la cible et dit, pour chaque brique, ce que le socle en contient déjà.
+Écrit le 12/10/2026 avec le socle (v0.1.0), complété le même jour (v0.2.0 : canaux par profil, hors ligne d'abord, coffre de documents, cartes virtuelles et conversions ; v0.3.0 : paiements de factures par ORCHEA, connexion par NIN et code SMS, PostgreSQL ; le 13/10, séparation des fonds par espace puis v0.4.0 : bureaux GAPP Entreprise et Administration). Ce document décrit la cible et dit, pour chaque brique, ce que le socle en contient déjà.
 
 ## 1. Ce qu'est App GN
 
@@ -155,8 +155,36 @@ Dématérialiser les supports : carte d'identité, permis, carte grise, attestat
 | Espace | Branché dans le socle | Prévu |
 |---|---|---|
 | Citoyen | vue consolidée, envoi, paiement de facture (hors ligne compris), cartes virtuelles, conversions, documents | rattacher un compte, passer en pro |
-| Entreprise | trésorerie consolidée, paiement fournisseur avec approbation, documents | facturation, TVA, paie, score B2B |
-| Administration | situation des comptes, mandat, visa et paiement, documents | paie des agents, exécution budgétaire, reporting Cour des Comptes |
+| Entreprise | trésorerie et projection, factures scellées, fournisseurs et lots, TVA, équipe et paie, score B2B, journal comptable, documents | financement adossé au score, déclarations sociales |
+| Administration | situation, budget, chaîne de la dépense, paie des agents contrôlée, recettes, rapport Cour des comptes, documents | ordonnancement multi-niveaux, recettes encaissées par App GN |
+
+### 10.1 Bureaux GAPP
+
+Décision : [ADR-007](adr/adr-007-bureaux-gapp.md). Code : `packages/core/src/gapp/` (`business.ts`, `administration.ts`, `desk.ts`, `routes.ts`, `demo.ts`), écrans `apps/web/src/Business.tsx` et `Administration.tsx`.
+
+**Entreprise (GAPP).** Rubriques et rôles qui les ouvrent :
+
+| Rubrique | Ce qu'elle fait | Rôles |
+|---|---|---|
+| Trésorerie | disponible en GNF, devises à part, projection à 7 jours (factures à leur échéance, fournisseurs, paie, TVA avant le 15), point bas et tension, créances en retard, fournisseurs échus | dirigeant, DAF, comptable |
+| Factures | émission `FAC-AAAA-NNNN` sans trou, scellée et chaînée, TVA 18 % ou exonérée ; encaissement, annulation motivée ; rapprochement des encaissements | dirigeant, DAF, comptable |
+| Fournisseurs | factures reçues ; lot de paiement (50 lignes au plus) avec rail et frais estimés ; au-delà de 5 M GNF, un second habilité approuve ou refuse | DAF propose, dirigeant approuve |
+| TVA | collectée moins déductible par mois ; déclaration et paiement à la DGI d'un seul geste ; crédit reporté ; période close | dirigeant et DAF déclarent, comptable consulte |
+| Équipe et paie | embauche, fin de contrat, attestation de travail déposée dans le coffre du salarié, paie du mois en lot | dirigeant, RH |
+| Score B2B | indicatif, cinq critères pondérés, détail par critère | dirigeant, DAF, comptable |
+| Journal | piste d'audit chaînée, export du journal comptable SYSCOHADA | dirigeant, DAF, comptable |
+
+**Administration (GAPP Institutionnel).**
+
+| Rubrique | Ce qu'elle fait | Rôles |
+|---|---|---|
+| Budget | lignes (dotation, engagé, mandaté, payé, disponible), taux d'exécution | tous |
+| Dépenses et mandats | engagement sur une ligne (crédit réservé), liquidation au service fait, mandat `MDT-AAAA-NNNN`, visa et paiement ou rejet motivé | ordonnateur engage et mandate ; comptable public vise |
+| Paie des agents | contrôle de l'état de paie contre l'état civil, mandat de paie sur la ligne de paie, visa et paiement | ordonnateur prépare ; comptable public paie |
+| Recettes | encaissements par nature | ordonnateur, comptable public, contrôle |
+| Contrôle | piste d'audit chaînée, rapport Cour des comptes (CSV) | ordonnateur, comptable public, contrôle |
+
+Un espace administration ne paie jamais en direct : le noyau refuse tout paiement qui ne vient pas d'un mandat.
 
 ## 11. Ce qui reste simulé ou absent
 
@@ -166,7 +194,8 @@ Dématérialiser les supports : carte d'identité, permis, carte grise, attestat
 - Documents : fictifs, aucun émetteur raccordé, pas encore de signature.
 - Connecteurs : tous simulés. Chaque fournisseur réel demande un accord et une API (voir `positionnement/chiffres-a-sourcer.md` pour Ecobank, UBA, Cellcom, Moov).
 - Orchestrateur : simulé par défaut ; ORCHEA pour les factures depuis Orange Money et MTN MoMo quand `ORCHEA_*` est réglé (§6).
-- Piste d'audit, notifications, rattachement d'un compte, bascule citoyen → pro : à construire.
+- Piste d'audit : chaînée pour les bureaux GAPP (§10.1), pas encore pour l'espace citoyen. Notifications, rattachement d'un compte, bascule citoyen → pro : à construire.
+- Bureaux GAPP : taux, frais, plan comptable et nomenclature budgétaire de démonstration ; DGI fictive ; état civil de démonstration pour le contrôle de paie.
 
 ## 12. Données
 
@@ -177,6 +206,8 @@ Le port `AppStore` (`packages/core/src/store.ts`) garde ce qui doit survivre à 
 | `DATABASE_URL=postgres://…` | serveur PostgreSQL (cible en service ; `DATABASE_POOL_SIZE`, 10 par défaut) |
 | `APPGN_PGLITE_DIR=./.data` | PostgreSQL embarqué (PGlite) dans ce dossier, pour un poste sans serveur |
 | rien | mémoire, perdue à l'arrêt |
+
+Les bureaux GAPP gardent leurs enregistrements (factures, lots, engagements, mandats, agents, journaux) dans `desk_records` : JSONB versionné, écrit par `UPDATE … WHERE version = …`, ce qui donne des numéros sans trou et des crédits engagés jamais dépassés, même à plusieurs instances.
 
 Le schéma (`db/schema.sql`) s'applique au démarrage et se rejoue sans effet. Les objets sont gardés en JSONB, dans la forme exacte du noyau, avec en colonnes ce qui sert à chercher et à verrouiller. Chaque garantie tient dans une seule instruction SQL, donc plusieurs instances peuvent partager la base :
 - une clé d'idempotence se réserve par `INSERT … ON CONFLICT DO NOTHING` avant tout effet, et se libère si la demande est refusée ;
