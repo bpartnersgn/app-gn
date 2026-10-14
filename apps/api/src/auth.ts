@@ -13,6 +13,10 @@ import { AppError, normalizeNin, type AppGn, type SpaceEntry } from '@app-gn/cor
  * - Qui n'a que son espace personnel y entre directement. Qui a aussi une organisation choisit après le code
  *   (jeton de choix, 5 minutes, usage unique), ou nomme l'espace dès la demande de session.
  *
+ * Inscription : NIN, nom et numéro ; le code part au numéro donné, qui est ainsi prouvé ; la personne et son espace
+ * personnel naissent à la saisie du code, et elle y entre aussitôt. Un NIN déjà inscrit ne reçoit pas de code
+ * (même réponse) : son titulaire est prévenu sur son propre numéro.
+ *
  * Défis, demandes de code et révocations vivent dans un `AuthStore` : en mémoire, ou en base (`db/postgres-store.ts`),
  * qui les garde d'un redémarrage à l'autre et les partage entre instances.
  */
@@ -40,11 +44,18 @@ const CODES_PER_WINDOW = 3;
 const CODE_WINDOW_MS = 15 * 60_000;
 export const SESSION_TTL_MS = 12 * 60 * 60_000;
 
+/** Ce qu'un défi permet une fois le code donné : se connecter, s'inscrire, choisir l'espace, confirmer une opération. */
+export type ChallengePurpose = 'signin' | 'registration' | 'selection' | 'confirmation';
+
 export interface Challenge {
+  /** `signin` si absent (défis écrits avant la migration 4). */
+  purpose?: ChallengePurpose;
   personId?: string;
   codeHash?: string;
   expiresAt: number;
   attempts: number;
+  /** Ce que le défi porte : la demande d'inscription, l'opération à confirmer. */
+  payload?: unknown;
 }
 
 export interface AuthStore {
@@ -140,40 +151,30 @@ export class Auth {
     if (await this.store.recordCodeRequest(key, now, now - CODE_WINDOW_MS + 1) > CODES_PER_WINDOW) {
       throw new AppError('rate_limited', 'trop de codes demandés : réessayez dans quelques minutes');
     }
-    const person = this.app.personByNin(nin);
+    const person = await this.app.findPersonByNin(nin);
     if (!person) {
       // Même réponse qu'un NIN connu ; le défi ne pourra jamais aboutir.
-      await this.store.saveChallenge(challengeId, { expiresAt, attempts: 0 });
+      await this.store.saveChallenge(challengeId, { purpose: 'signin', expiresAt, attempts: 0 });
       return { challengeId, expiresAt: new Date(expiresAt).toISOString() };
     }
     const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
-    await this.store.saveChallenge(challengeId, { personId: person.id, codeHash: this.hashCode(challengeId, code), expiresAt, attempts: 0 });
+    await this.store.saveChallenge(challengeId, { purpose: 'signin', personId: person.id, codeHash: this.hashCode(challengeId, code), expiresAt, attempts: 0 });
     await this.sms.send(person.phone, `App GN : votre code de connexion est ${code}. Il expire dans 5 minutes. Ne le donnez à personne.`);
     return { challengeId, expiresAt: new Date(expiresAt).toISOString(), ...(this.revealCodes ? { demoCode: code } : {}) };
   }
 
   /** Étape 2 : échanger le code contre une session dans un espace, ou contre le choix de l'espace. */
   async verifyCode(challengeId: unknown, code: unknown, spaceId?: unknown): Promise<SignInResult> {
-    const refused = new AppError('unauthenticated', 'code incorrect ou expiré');
-    if (typeof challengeId !== 'string' || typeof code !== 'string' || challengeId.length > 64) throw refused;
-    const challenge = await this.store.countAttempt(challengeId);
-    if (!challenge) throw refused;
-    if (challenge.expiresAt <= this.now() || challenge.attempts > MAX_ATTEMPTS) {
-      await this.store.consumeChallenge(challengeId);
-      throw refused;
-    }
-    const ok = challenge.personId !== undefined && challenge.codeHash !== undefined && /^\d{6}$/.test(code)
-      && safeEqual(this.hashCode(challengeId, code), challenge.codeHash);
-    if (!ok) throw refused;
+    const challenge = await this.checkCode(challengeId, code, 'signin');
     const personId = challenge.personId!;
     const spaces = this.app.entrances(personId, 'desktop');
     // L'espace demandé se vérifie avant de consommer le code : une erreur de choix ne coûte pas un nouveau SMS.
     if (spaceId !== undefined && !spaces.some((space) => space.id === spaceId)) throw new AppError('not_a_member', 'espace inaccessible');
-    if (!await this.store.consumeChallenge(challengeId)) throw refused;
+    if (!await this.store.consumeChallenge(challengeId as string)) throw new AppError('unauthenticated', 'code incorrect ou expiré');
     if (typeof spaceId === 'string') return { kind: 'session', ...this.issue(personId, spaceId) };
     if (spaces.length === 1) return { kind: 'session', ...this.issue(personId, spaces[0]!.id) };
     const selectionToken = randomUUID();
-    await this.store.saveChallenge(selectionToken, { personId, expiresAt: this.now() + CODE_TTL_MS, attempts: 0 });
+    await this.store.saveChallenge(selectionToken, { purpose: 'selection', personId, expiresAt: this.now() + CODE_TTL_MS, attempts: 0 });
     return { kind: 'choose_space', selectionToken, spaces };
   }
 
@@ -183,12 +184,64 @@ export class Auth {
     if (typeof selectionToken !== 'string' || selectionToken.length > 64 || typeof spaceId !== 'string') throw refused;
     const selection = await this.store.countAttempt(selectionToken);
     // Un défi de code (qui porte une empreinte) n'est pas un jeton de choix.
-    if (!selection?.personId || selection.codeHash !== undefined || selection.expiresAt <= this.now() || selection.attempts > MAX_ATTEMPTS) throw refused;
+    if (!selection?.personId || selection.purpose !== 'selection' || selection.codeHash !== undefined || selection.expiresAt <= this.now() || selection.attempts > MAX_ATTEMPTS) throw refused;
     if (!this.app.entrances(selection.personId, 'desktop').some((space) => space.id === spaceId)) {
       throw new AppError('not_a_member', 'espace inaccessible');
     }
     if (!await this.store.consumeChallenge(selectionToken)) throw refused;
     return this.issue(selection.personId, spaceId);
+  }
+
+  /** Inscription, étape 1 : contrôler la demande et envoyer un code au numéro donné. */
+  async requestRegistration(input: unknown): Promise<{ challengeId: string; expiresAt: string; demoCode?: string }> {
+    const request = this.app.checkRegistration(input as never);
+    await this.store.sweep(this.now(), this.now() - CODE_WINDOW_MS + 1);
+    const now = this.now();
+    // Mêmes plafonds que la connexion, par NIN et par numéro : ni SMS en rafale, ni NIN essayés en série.
+    for (const key of [request.nin, `tel:${request.phone}`]) {
+      if (await this.store.recordCodeRequest(key, now, now - CODE_WINDOW_MS + 1) > CODES_PER_WINDOW) {
+        throw new AppError('rate_limited', 'trop de codes demandés : réessayez dans quelques minutes');
+      }
+    }
+    const challengeId = randomUUID();
+    const expiresAt = now + CODE_TTL_MS;
+    const existing = await this.app.findPersonByNin(request.nin);
+    if (existing) {
+      // Même réponse que pour un nouveau NIN ; aucun code ne part. Le titulaire est prévenu sur son numéro.
+      await this.store.saveChallenge(challengeId, { purpose: 'registration', expiresAt, attempts: 0 });
+      await this.sms.send(existing.phone, 'App GN : une inscription a été demandée avec votre NIN. Vous avez déjà un compte : connectez-vous. Si ce n’est pas vous, ignorez ce message.');
+      return { challengeId, expiresAt: new Date(expiresAt).toISOString() };
+    }
+    const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
+    await this.store.saveChallenge(challengeId, { purpose: 'registration', codeHash: this.hashCode(challengeId, code), expiresAt, attempts: 0, payload: request });
+    await this.sms.send(request.phone, `App GN : votre code d’inscription est ${code}. Il expire dans 5 minutes. Ne le donnez à personne.`);
+    return { challengeId, expiresAt: new Date(expiresAt).toISOString(), ...(this.revealCodes ? { demoCode: code } : {}) };
+  }
+
+  /** Inscription, étape 2 : le code prouve le numéro ; la personne naît avec son espace personnel, et y entre. */
+  async confirmRegistration(challengeId: unknown, code: unknown): Promise<{ token: string; session: Session }> {
+    const challenge = await this.checkCode(challengeId, code, 'registration');
+    if (!await this.store.consumeChallenge(challengeId as string)) throw new AppError('unauthenticated', 'code incorrect ou expiré');
+    const { person, space } = await this.app.register(challenge.payload as never);
+    return this.issue(person.id, space.id);
+  }
+
+  /**
+   * Compte un essai et vérifie le code d'un défi de l'objet attendu. Ne consomme pas le défi : l'appelant le fait
+   * quand tout le reste est vérifié (une erreur de choix ne coûte pas un nouveau SMS).
+   */
+  private async checkCode(challengeId: unknown, code: unknown, purpose: ChallengePurpose): Promise<Challenge> {
+    const refused = new AppError('unauthenticated', 'code incorrect ou expiré');
+    if (typeof challengeId !== 'string' || typeof code !== 'string' || challengeId.length > 64) throw refused;
+    const challenge = await this.store.countAttempt(challengeId);
+    if (!challenge || (challenge.purpose ?? 'signin') !== purpose) throw refused;
+    if (challenge.expiresAt <= this.now() || challenge.attempts > MAX_ATTEMPTS) {
+      await this.store.consumeChallenge(challengeId);
+      throw refused;
+    }
+    const ok = challenge.codeHash !== undefined && /^\d{6}$/.test(code) && safeEqual(this.hashCode(challengeId, code), challenge.codeHash);
+    if (!ok) throw refused;
+    return challenge;
   }
 
   issue(personId: string, spaceId: string): { token: string; session: Session } {

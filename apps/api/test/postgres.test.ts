@@ -45,7 +45,7 @@ describe('PostgreSQL', () => {
   it('le schéma se rejoue sans erreur', async () => {
     await migrate(sql);
     const { rows } = await sql.query<{ version: number }>('SELECT version FROM schema_version');
-    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3]);
+    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3, 4]);
   });
 
   it('une base déjà en version 2 ne reçoit que les migrations suivantes ; une migration qui échoue ne laisse rien', async () => {
@@ -55,14 +55,14 @@ describe('PostgreSQL', () => {
     try {
       const migrations = await loadMigrations();
       assert.deepEqual(await migrate(local, migrations.slice(0, 2)), [1, 2]);
-      assert.deepEqual(await migrate(local, migrations), [3]);
+      assert.deepEqual(await migrate(local, migrations), [3, 4]);
       assert.deepEqual(await migrate(local, migrations), []);
-      const broken = { version: 4, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
-      await assert.rejects(migrate(local, [...migrations, broken]), /migration 4 \(essai\)/);
+      const broken = { version: 5, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
+      await assert.rejects(migrate(local, [...migrations, broken]), /migration 5 \(essai\)/);
       const { rows } = await local.query<{ found: string | null }>("SELECT to_regclass('essai_rollback')::text AS found");
       assert.equal(rows[0]?.found, null);
       const versions = await local.query<{ version: number }>('SELECT version FROM schema_version ORDER BY version');
-      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3]);
+      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3, 4]);
     } finally {
       await database.close();
     }
@@ -196,5 +196,61 @@ describe('PostgreSQL : bureaux GAPP', () => {
     // L'attestation de Kadiatou est redéposée dans son coffre après le redémarrage.
     const vault = restarted.documents({ personId: 'per_kadiatou', channel: 'phone', spaceId: 'spc_cit_kadiatou' }, 'spc_cit_kadiatou');
     assert.ok(vault.some((document) => document.category === 'employment'));
+  });
+
+  it('référentiel : versé une fois, une inscription survit au redémarrage et se voit d’une autre instance', async () => {
+    const first = (await loadDemoApp({ store, directory: store })).app;
+    assert.equal(first.personByNin('GN-NIN-0000000006')?.fullName, 'Kadiatou Sow');
+    const { person, space } = await first.register({ nin: 'gn-nin-0000009001', fullName: 'Néné  Kaba', phone: '620 11 22 33' });
+    assert.equal(person.nin, 'GN-NIN-0000009001');
+    assert.equal(person.fullName, 'Néné Kaba');
+    assert.equal(person.phone, '+224 620 11 22 33');
+    assert.equal(person.identity, 'declared');
+    // Une autre instance, démarrée avant l'inscription, la trouve à la première recherche (relecture sur absence).
+    const second = (await loadDemoApp({ store, directory: store })).app;
+    assert.equal((await second.findPersonByNin('GN-NIN-0000009001'))?.id, person.id);
+    assert.deepEqual(second.me({ personId: person.id, channel: 'phone', spaceId: space.id }).spaces.map((access) => access.space.id), [space.id]);
+    await assert.rejects(second.register({ nin: 'GN-NIN-0000009001', fullName: 'Autre Nom', phone: '+224 621 00 00 00' }), { code: 'conflict' });
+    const { rows } = await sql.query<{ count: string }>('SELECT count(*) FROM persons');
+    assert.equal(Number(rows[0]?.count), 9);
+  });
+
+  it('référentiel : deux inscriptions simultanées d’un même NIN, une seule passe', async () => {
+    const one = (await loadDemoApp({ store, directory: store })).app;
+    const two = (await loadDemoApp({ store, directory: store })).app;
+    const results = await Promise.allSettled([
+      one.register({ nin: 'GN-NIN-0000009002', fullName: 'Fanta Cissé', phone: '+224 622 33 44 55' }),
+      two.register({ nin: 'GN-NIN-0000009002', fullName: 'Fanta Cissé', phone: '+224 622 33 44 55' }),
+    ]);
+    assert.deepEqual(results.map((result) => result.status).sort(), ['fulfilled', 'rejected']);
+    const { rows } = await sql.query<{ count: string }>("SELECT count(*) FROM spaces WHERE document->>'ownerPersonId' IN (SELECT id FROM persons WHERE nin = 'GN-NIN-0000009002')");
+    assert.equal(Number(rows[0]?.count), 1);
+  });
+
+  it('membres : rattacher, retirer, et l’autre instance le voit après relecture', async () => {
+    const one = (await loadDemoApp({ store, directory: store })).app;
+    const two = (await loadDemoApp({ store, directory: store })).app;
+    const sekou: Actor = { personId: 'per_sekou', channel: 'desktop', spaceId: 'spc_biz_boke' };
+    const added = await one.addMember(sekou, 'spc_biz_boke', { nin: 'GN-NIN-0000000006', role: 'business_accountant' });
+    assert.equal(added.roleLabel, 'Comptable');
+    const kadiatou: Actor = { personId: 'per_kadiatou', channel: 'desktop', spaceId: 'spc_biz_boke' };
+    await assert.rejects(two.overview(kadiatou, 'spc_biz_boke'), { code: 'not_a_member' });
+    await two.refresh();
+    assert.equal((await two.overview(kadiatou, 'spc_biz_boke')).total.currency, 'GNF');
+    await one.removeMember(sekou, 'spc_biz_boke', 'per_kadiatou');
+    await two.refresh();
+    await assert.rejects(two.overview(kadiatou, 'spc_biz_boke'), { code: 'not_a_member' });
+  });
+
+  it('inscription par l’API : code au numéro donné, personne et espace en base, session ouverte', async () => {
+    const { app } = await loadDemoApp({ store, directory: store });
+    const sms = new MemorySmsSender();
+    const auth = new Auth({ app, sms, secret: 'cle-de-session-de-test-0123456789abcdef', store });
+    const asked = await auth.requestRegistration({ nin: 'GN-NIN-0000009003', fullName: 'Ibrahim Fofana', phone: '+224 623 45 67 89' });
+    const code = sms.lastCodeFor('+224 623 45 67 89')!;
+    const { session } = await auth.confirmRegistration(asked.challengeId, code);
+    const { rows } = await sql.query<{ nin: string }>('SELECT p.nin FROM persons p JOIN memberships m ON m.person_id = p.id WHERE m.space_id = $1', [session.spaceId]);
+    assert.deepEqual(rows.map((row) => row.nin), ['GN-NIN-0000009003']);
+    await assert.rejects(auth.confirmRegistration(asked.challengeId, code), { code: 'unauthenticated' });
   });
 });

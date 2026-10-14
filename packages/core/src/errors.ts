@@ -9,7 +9,8 @@ export type ErrorCode =
   | 'invalid_state'
   | 'separation_of_duties'
   | 'channel_not_allowed'
-  | 'rate_limited';
+  | 'rate_limited'
+  | 'conflict';
 
 const STATUS: Record<ErrorCode, number> = {
   unauthenticated: 401,
@@ -23,6 +24,7 @@ const STATUS: Record<ErrorCode, number> = {
   separation_of_duties: 403,
   channel_not_allowed: 403,
   rate_limited: 429,
+  conflict: 409,
 };
 
 export class AppError extends Error {

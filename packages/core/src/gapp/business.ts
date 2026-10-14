@@ -359,7 +359,7 @@ export class BusinessDesk {
   /** Redépose dans les coffres personnels les attestations émises avant un redémarrage. */
   async load(spaceIds: readonly string[]): Promise<void> {
     for (const spaceId of spaceIds) {
-      for (const { value } of await this.store.list<Certificate>('certificates', spaceId)) this.deposit(value);
+      for (const { value } of await this.store.list<Certificate>('certificates', spaceId)) await this.deposit(value);
     }
   }
 
@@ -820,7 +820,7 @@ export class BusinessDesk {
       ],
     };
     await this.store.insert('certificates', certificate);
-    this.deposit(certificate);
+    await this.deposit(certificate);
     await this.record(context, actor, 'certificate.issued', certificate.id, `Attestation de travail · ${employee.fullName}`);
     return certificate;
   }
@@ -969,8 +969,8 @@ export class BusinessDesk {
     await this.audit.append(context.space.id, { at: context.at, personId: actor.personId, personName: context.personName, action, target, summary });
   }
 
-  private deposit(certificate: Certificate): void {
-    this.app.depositIssuedDocument(certificate.holderNin, {
+  private async deposit(certificate: Certificate): Promise<void> {
+    await this.app.depositIssuedDocument(certificate.holderNin, {
       id: certificate.documentId,
       category: 'employment',
       title: 'Attestation de travail',

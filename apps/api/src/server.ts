@@ -21,8 +21,12 @@ const database = await databaseFromEnvironment(process.env);
 // Données fictives. Sans ORCHEA_* : tout est simulé. Avec : le paiement des factures depuis Orange Money
 // ou MTN MoMo passe par ORCHEA (en mode test, son simulateur), le reste reste simulé.
 const orchea = orcheaFromEnvironment(process.env);
+// Référentiel : en base quand il y en a une. Les données de démonstration n'y sont versées (une fois, base vide)
+// qu'hors production.
+const production = process.env.APPGN_ENV === 'production';
 const { app } = await loadDemoApp({
   store: database?.store,
+  ...(database ? { directory: database.store, seedDirectory: !production } : {}),
   orchestrator: orchea
     ? (network, now) => new OrcheaOrchestrator({
         ...orchea.config,
@@ -33,7 +37,14 @@ const { app } = await loadDemoApp({
 });
 
 // Tableaux de bord GAPP, dans la même base ; les données de démonstration n'y sont versées qu'une fois.
-const gapp = await loadDemoGapp(app, { store: database?.store });
+const gapp = await loadDemoGapp(app, { store: database?.store, seed: !production });
+
+// Une autre instance a pu inscrire, rattacher ou retirer quelqu'un : relecture du référentiel à intervalle régulier
+// (et, pour un NIN ou un espace inconnu, aussitôt).
+const refreshEvery = Number(process.env.APPGN_DIRECTORY_REFRESH_MS ?? 30_000);
+const refresher = database && refreshEvery > 0
+  ? setInterval(() => void app.refresh().catch((error: unknown) => console.error('relecture du référentiel', error)), refreshEvery).unref()
+  : undefined;
 
 // Connexion par NIN + code SMS. Aucun fournisseur SMS n'est branché : en démonstration (APPGN_DEMO_LOGIN,
 // activée par défaut), la réponse porte le code ; APPGN_DEMO_LOGIN=off ferme la connexion de démo et le code affiché.
@@ -50,6 +61,7 @@ const server = buildServer(app, {
   trustProxy: trustProxyFromEnvironment(process.env.APPGN_TRUST_PROXY),
   ...(orchea ? { orcheaWebhooks: new OrcheaWebhookReceiver(app, orchea.webhookSecrets, { processed: database?.store }) } : {}),
 });
+if (refresher) server.addHook('onClose', async () => clearInterval(refresher));
 if (database) server.addHook('onClose', database.close);
 await server.listen({ port, host });
 server.log.info({ database: database?.kind ?? 'mémoire' }, 'stockage');

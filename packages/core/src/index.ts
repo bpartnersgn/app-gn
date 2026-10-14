@@ -13,6 +13,7 @@ export * from './documents.ts';
 export * from './cards.ts';
 export * from './sync.ts';
 export * from './store.ts';
+export * from './directory.ts';
 export * from './app.ts';
 export * from './gapp/desk.ts';
 export * from './gapp/business.ts';

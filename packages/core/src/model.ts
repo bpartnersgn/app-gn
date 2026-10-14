@@ -9,6 +9,12 @@ export interface Person {
   nin: string;
   fullName: string;
   phone: string;
+  /**
+   * `declared` : inscrite par elle-même, numéro prouvé par code SMS, NIN déclaré (pas encore rapproché de
+   * l'état civil). `verified` : identité rapprochée. Absent : donnée de démonstration, tenue pour vérifiée.
+   */
+  identity?: 'declared' | 'verified';
+  registeredAt?: string;
 }
 
 export type SpaceKind = 'citizen' | 'business' | 'administration';

@@ -1,6 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
-import type { AppStore, DeskCollection, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
-import type { AuthStore, Challenge } from '../auth.ts';
+import type { AppStore, CitizenSpace, DeskCollection, Directory, DirectoryStore, Membership, Person, Role, Space, VaultDocument, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
+import type { AuthStore, Challenge, ChallengePurpose } from '../auth.ts';
 import type { ProcessedEvents } from '../orchea.ts';
 import type { RateLimitStore } from '../security.ts';
 
@@ -70,7 +70,7 @@ export async function migrate(sql: Sql, migrations?: readonly Migration[]): Prom
 
 type Json<T> = { document: T };
 
-export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore, RateLimitStore {
+export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore, RateLimitStore, DirectoryStore {
   private readonly sql: Sql;
   constructor(sql: Sql) {
     this.sql = sql;
@@ -175,14 +175,14 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, Desk
 
   async saveChallenge(id: string, challenge: Challenge): Promise<void> {
     await this.sql.query(
-      'INSERT INTO auth_challenges (id, person_id, code_hash, expires_at, attempts) VALUES ($1, $2, $3, $4, $5)',
-      [id, challenge.personId ?? null, challenge.codeHash ?? null, challenge.expiresAt, challenge.attempts],
+      'INSERT INTO auth_challenges (id, person_id, code_hash, expires_at, attempts, purpose, payload) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [id, challenge.personId ?? null, challenge.codeHash ?? null, challenge.expiresAt, challenge.attempts, challenge.purpose ?? 'signin', challenge.payload === undefined ? null : JSON.stringify(challenge.payload)],
     );
   }
 
   async countAttempt(id: string): Promise<Challenge | undefined> {
-    const { rows } = await this.sql.query<{ person_id: string | null; code_hash: string | null; expires_at: string; attempts: number }>(
-      'UPDATE auth_challenges SET attempts = attempts + 1 WHERE id = $1 RETURNING person_id, code_hash, expires_at, attempts',
+    const { rows } = await this.sql.query<{ person_id: string | null; code_hash: string | null; expires_at: string; attempts: number; purpose: ChallengePurpose; payload: unknown }>(
+      'UPDATE auth_challenges SET attempts = attempts + 1 WHERE id = $1 RETURNING person_id, code_hash, expires_at, attempts, purpose, payload',
       [id],
     );
     const row = rows[0];
@@ -192,6 +192,8 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, Desk
       ...(row.code_hash ? { codeHash: row.code_hash } : {}),
       expiresAt: Number(row.expires_at),
       attempts: row.attempts,
+      purpose: row.purpose,
+      ...(row.payload !== null && row.payload !== undefined ? { payload: row.payload } : {}),
     };
   }
 
@@ -274,6 +276,70 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, Desk
     }
     const counts = new Map(rows.map((row) => [row.key, Number(row.count)]));
     return keys.map((key) => counts.get(key) ?? 0);
+  }
+
+
+  // ── Référentiel ──
+
+  async load(): Promise<Directory> {
+    const [persons, spaces, memberships, accounts, documents] = await Promise.all([
+      this.sql.query<Json<Person>>('SELECT document FROM persons ORDER BY id'),
+      this.sql.query<Json<Space>>('SELECT document FROM spaces ORDER BY id'),
+      this.sql.query<{ person_id: string; space_id: string; role: Role }>('SELECT person_id, space_id, role FROM memberships ORDER BY person_id, space_id'),
+      this.sql.query<Json<LinkedAccount>>('SELECT document FROM linked_accounts ORDER BY id'),
+      this.sql.query<Json<VaultDocument>>('SELECT document FROM vault_documents ORDER BY id'),
+    ]);
+    return {
+      persons: persons.rows.map((row) => row.document),
+      spaces: spaces.rows.map((row) => row.document),
+      memberships: memberships.rows.map((row): Membership => ({ personId: row.person_id, spaceId: row.space_id, role: row.role })),
+      accounts: accounts.rows.map((row) => row.document),
+      documents: documents.rows.map((row) => row.document),
+    };
+  }
+
+  /** Personne, espace personnel et rattachement en une instruction : tout ou rien, et un NIN pris une seule fois. */
+  async addPerson(person: Person, space: CitizenSpace): Promise<boolean> {
+    const { rows } = await this.sql.query(
+      `WITH p AS (INSERT INTO persons (id, nin, document) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id),
+            s AS (INSERT INTO spaces (id, kind, document) SELECT $4, 'citizen', $5 FROM p RETURNING id),
+            m AS (INSERT INTO memberships (person_id, space_id, role) SELECT p.id, s.id, 'citizen' FROM p, s RETURNING person_id)
+       SELECT person_id FROM m`,
+      [person.id, person.nin, JSON.stringify(person), space.id, JSON.stringify(space)],
+    );
+    return rows.length === 1;
+  }
+
+  async addSpace(space: Space): Promise<boolean> {
+    const { rows } = await this.sql.query('INSERT INTO spaces (id, kind, document) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id', [space.id, space.kind, JSON.stringify(space)]);
+    return rows.length === 1;
+  }
+
+  async setMembership(membership: Membership): Promise<void> {
+    await this.sql.query(
+      'INSERT INTO memberships (person_id, space_id, role) VALUES ($1, $2, $3) ON CONFLICT (person_id, space_id) DO UPDATE SET role = EXCLUDED.role',
+      [membership.personId, membership.spaceId, membership.role],
+    );
+  }
+
+  async removeMembership(personId: string, spaceId: string): Promise<boolean> {
+    const { rows } = await this.sql.query('DELETE FROM memberships WHERE person_id = $1 AND space_id = $2 RETURNING person_id', [personId, spaceId]);
+    return rows.length === 1;
+  }
+
+  async addAccount(account: LinkedAccount): Promise<void> {
+    await this.sql.query(
+      'INSERT INTO linked_accounts (id, space_id, document) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET document = EXCLUDED.document',
+      [account.id, account.spaceId, JSON.stringify(account)],
+    );
+  }
+
+  async addDocument(document: VaultDocument): Promise<boolean> {
+    const { rows } = await this.sql.query(
+      'INSERT INTO vault_documents (id, space_id, verification_code, document) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING id',
+      [document.id, document.spaceId, document.verificationCode ?? null, JSON.stringify(document)],
+    );
+    return rows.length === 1;
   }
 
 }

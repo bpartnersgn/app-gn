@@ -173,3 +173,91 @@ describe('connexion par NIN', () => {
     assert.throws(() => new Auth({ app: createDemoApp().app, sms: new MemorySmsSender(), secret: 'court' }));
   });
 });
+
+describe('inscription', () => {
+  const asked = (context: ReturnType<typeof setup>, payload: unknown) => context.server.inject({ method: 'POST', url: '/v1/registrations', payload: payload as object });
+
+  it('NIN, nom, numéro → code au numéro donné → personne et espace personnel, session ouverte', async () => {
+    const context = setup();
+    const request = await asked(context, { nin: 'gn-nin-0000009100', fullName: 'Oumou Diakité', phone: '00224 625 10 20 30' });
+    assert.equal(request.statusCode, 202);
+    const code = context.sms.lastCodeFor('+224 625 10 20 30');
+    assert.match(code ?? '', /^\d{6}$/);
+    const wrong = await context.server.inject({ method: 'POST', url: '/v1/registrations/confirm', payload: { challengeId: request.json().challengeId, code: code === '000000' ? '111111' : '000000' } });
+    assert.equal(wrong.statusCode, 401);
+    const created = await context.server.inject({ method: 'POST', url: '/v1/registrations/confirm', payload: { challengeId: request.json().challengeId, code } });
+    assert.equal(created.statusCode, 201);
+    const { token, me } = created.json();
+    assert.equal(me.person.fullName, 'Oumou Diakité');
+    assert.equal(me.person.identity, 'declared');
+    assert.equal(me.spaces.length, 1);
+    assert.equal(me.spaces[0].space.kind, 'citizen');
+    assert.deepEqual(me.otherSpaces, []);
+    // La personne inscrite se connecte ensuite par son NIN, comme tout le monde.
+    const signedIn = await signIn(context, 'GN-NIN-0000009100', '+224 625 10 20 30', null);
+    assert.equal(signedIn.statusCode, 201);
+    assert.equal(signedIn.json().me.person.id, me.person.id);
+    const headers = { authorization: `Bearer ${token}` };
+    assert.equal((await context.server.inject({ method: 'GET', url: `/v1/spaces/${me.spaces[0].space.id}/overview`, headers })).json().positions.length, 0);
+  });
+
+  it('un NIN déjà inscrit : même réponse, aucun code, le titulaire est prévenu sur son numéro', async () => {
+    const context = setup();
+    const request = await asked(context, { nin: 'GN-NIN-0000000006', fullName: 'Usurpateur Test', phone: '+224 666 00 00 99' });
+    assert.equal(request.statusCode, 202);
+    assert.deepEqual(Object.keys(request.json()).sort(), ['challengeId', 'expiresAt']);
+    assert.equal(context.sms.sent.some((message) => message.phone === '+224 666 00 00 99'), false);
+    assert.match(context.sms.sent.at(-1)?.text ?? '', /déjà un compte/);
+    assert.equal(context.sms.sent.at(-1)?.phone, '+224 625 00 00 06');
+    for (const code of ['000000', '123456']) {
+      const tried = await context.server.inject({ method: 'POST', url: '/v1/registrations/confirm', payload: { challengeId: request.json().challengeId, code } });
+      assert.equal(tried.statusCode, 401);
+    }
+  });
+
+  it('contrôle la demande et limite les codes par NIN et par numéro', async () => {
+    const context = setup();
+    assert.equal((await asked(context, { nin: 'GN-NIN-0000009101', fullName: 'A', phone: '+224 620 00 00 00' })).statusCode, 400);
+    assert.equal((await asked(context, { nin: 'GN-NIN-0000009101', fullName: 'Awa Condé', phone: '+33 6 12 34 56 78' })).statusCode, 400);
+    assert.equal((await asked(context, { nin: '%%', fullName: 'Awa Condé', phone: '+224 620 00 00 00' })).statusCode, 400);
+    for (let index = 0; index < 3; index += 1) {
+      assert.equal((await asked(context, { nin: `GN-NIN-000000920${index}`, fullName: 'Awa Condé', phone: '+224 629 00 00 00' })).statusCode, 202);
+    }
+    assert.equal((await asked(context, { nin: 'GN-NIN-0000009209', fullName: 'Awa Condé', phone: '+224 629 00 00 00' })).statusCode, 429);
+  });
+
+  it('un code d’inscription n’ouvre pas de session de connexion, et l’inverse', async () => {
+    const context = setup();
+    const request = await asked(context, { nin: 'GN-NIN-0000009102', fullName: 'Awa Condé', phone: '+224 629 11 11 11' });
+    const code = context.sms.lastCodeFor('+224 629 11 11 11');
+    const crossed = await context.server.inject({ method: 'POST', url: '/v1/auth/sessions', payload: { challengeId: request.json().challengeId, code } });
+    assert.equal(crossed.statusCode, 401);
+    const login = await context.server.inject({ method: 'POST', url: '/v1/auth/codes', payload: { nin: 'GN-NIN-0000000006' } });
+    const loginCode = context.sms.lastCodeFor('+224 625 00 00 06');
+    const crossedBack = await context.server.inject({ method: 'POST', url: '/v1/registrations/confirm', payload: { challengeId: login.json().challengeId, code: loginCode } });
+    assert.equal(crossedBack.statusCode, 401);
+  });
+});
+
+describe('membres d’une organisation', () => {
+  const sekou = { authorization: 'Bearer demo:per_sekou@spc_biz_boke', 'appgn-channel': 'desktop' };
+
+  it('le dirigeant rattache une personne inscrite, change son rôle, la retire ; les autres rôles ne le peuvent pas', async () => {
+    const context = setup({ demoLogin: true });
+    const url = '/v1/spaces/spc_biz_boke/members';
+    const listed = await context.server.inject({ method: 'GET', url, headers: sekou });
+    assert.deepEqual(listed.json().map((member: { fullName: string }) => member.fullName), ['Aïssatou Barry', 'Alpha Diallo', 'Sékou Condé']);
+    const added = await context.server.inject({ method: 'POST', url, headers: sekou, payload: { nin: 'GN-NIN-0000000006', role: 'business_accountant' } });
+    assert.equal(added.statusCode, 201);
+    assert.equal(added.json().roleLabel, 'Comptable');
+    const kadiatou = { authorization: 'Bearer demo:per_kadiatou@spc_biz_boke', 'appgn-channel': 'desktop' };
+    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/spaces/spc_biz_boke/overview', headers: kadiatou })).statusCode, 200);
+    assert.equal((await context.server.inject({ method: 'GET', url, headers: kadiatou })).statusCode, 403);
+    assert.equal((await context.server.inject({ method: 'POST', url, headers: sekou, payload: { nin: 'GN-NIN-0000000006', role: 'admin_viewer' } })).statusCode, 400);
+    assert.equal((await context.server.inject({ method: 'POST', url, headers: sekou, payload: { nin: 'GN-NIN-0000009999', role: 'business_hr' } })).statusCode, 404);
+    assert.equal((await context.server.inject({ method: 'POST', url, headers: sekou, payload: { nin: 'GN-NIN-0000000005', role: 'business_hr' } })).statusCode, 400);
+    assert.equal((await context.server.inject({ method: 'DELETE', url: `${url}/per_kadiatou`, headers: sekou })).statusCode, 204);
+    assert.equal((await context.server.inject({ method: 'GET', url: '/v1/spaces/spc_biz_boke/overview', headers: kadiatou })).statusCode, 403);
+    assert.equal((await context.server.inject({ method: 'DELETE', url: `${url}/per_sekou`, headers: sekou })).statusCode, 400);
+  });
+});

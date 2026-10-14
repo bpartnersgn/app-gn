@@ -16,8 +16,9 @@ import {
 import { spaceOpensOn, type Actor } from './channels.ts';
 import { SimulatedConnector, SimulatedNetwork, type AccountConnector } from './connectors.ts';
 import { documentView, seedDocuments, type DocumentVerification, type DocumentView, type VaultDocument } from './documents.ts';
+import { MemoryDirectoryStore, normalizeGuineaMobile, normalizeNin, type Directory, type DirectoryStore } from './directory.ts';
 import { AppError } from './errors.ts';
-import type { AccountTransaction, LinkedAccount, Membership, Person, Role, Space } from './model.ts';
+import type { AccountTransaction, AdministrationSpace, BusinessSpace, CitizenSpace, LinkedAccount, Membership, Person, Role, Space } from './model.ts';
 import { convert, isCurrency, money, parseMajor, toBigInt, type Currency, type FxTable } from './money.ts';
 import {
   approvalRequirement,
@@ -30,7 +31,7 @@ import {
   type PaymentStatus,
 } from './payments.ts';
 import { PROVIDERS, providerById } from './providers.ts';
-import { can, permissionsOf, ROLE_LABELS, type Permission } from './rbac.ts';
+import { can, permissionsOf, ROLE_LABELS, ROLE_SPACE_KIND, type Permission } from './rbac.ts';
 import { DEMO_FX, seedDemo } from './seed.ts';
 import { MemoryAppStore, type AppStore } from './store.ts';
 import { servicesFor, type ServiceDefinition } from './services.ts';
@@ -95,7 +96,28 @@ export interface AppGnDependencies {
   aggregationTimeoutMs?: number;
   /** Paiements, idempotence, conversions, cartes émises. En mémoire par défaut. */
   store?: AppStore;
+  /**
+   * Le référentiel de référence (personnes, espaces, rattachements, comptes, documents). Les listes ci-dessus en
+   * sont la copie de travail. Par défaut, un magasin en mémoire tiré de ces listes.
+   */
+  directory?: DirectoryStore;
 }
+
+export interface RegistrationInput {
+  nin: string;
+  fullName: string;
+  phone: string;
+}
+
+export interface MemberView {
+  personId: string;
+  fullName: string;
+  role: Role;
+  roleLabel: string;
+}
+
+/** Délai minimal entre deux relectures du référentiel déclenchées par une absence (NIN inconnu, espace inconnu). */
+const REFRESH_ON_MISS_MS = 1000;
 
 /**
  * Couche application d'App GN : chaque cas d'usage vérifie d'abord que la personne est membre de l'espace,
@@ -108,11 +130,14 @@ export class AppGn {
   private readonly store: AppStore;
   private readonly quotes = new Map<string, ExchangeQuote>();
   private readonly now: () => Date;
+  private readonly directory: DirectoryStore;
+  private lastRefresh = 0;
 
   constructor(deps: AppGnDependencies) {
     this.deps = deps;
     this.now = deps.now ?? (() => new Date());
     this.store = deps.store ?? new MemoryAppStore();
+    this.directory = deps.directory ?? new MemoryDirectoryStore(deps);
     this.aggregator = new Aggregator({
       connectors: deps.connectors,
       fx: deps.fx,
@@ -143,10 +168,143 @@ export class AppGn {
     return this.deps.persons;
   }
 
+  /**
+   * Relit le référentiel et remplace la copie de travail (sur place : les bureaux GAPP gardent la même référence).
+   * Côté serveur, appelé au démarrage, à intervalle régulier, et quand une recherche ne trouve pas (une autre
+   * instance a pu inscrire la personne ou créer le rattachement).
+   */
+  async refresh(): Promise<void> {
+    const fresh = await this.directory.load();
+    this.lastRefresh = Date.now();
+    const cardAccounts = this.deps.accounts.filter((account) => this.deps.cards.some((card) => card.accountId === account.id));
+    replace(this.deps.persons, fresh.persons);
+    replace(this.deps.spaces, fresh.spaces);
+    replace(this.deps.memberships, fresh.memberships);
+    // Les comptes de carte émis sont gardés par le magasin des paiements (issued_cards) : on les conserve.
+    replace(this.deps.accounts, [...fresh.accounts, ...cardAccounts.filter((account) => !fresh.accounts.some((candidate) => candidate.id === account.id))]);
+    replace(this.deps.documents, fresh.documents);
+  }
+
+  /** Copie du référentiel de travail (pour le verser dans un magasin vide). */
+  snapshot(): Directory {
+    const { persons, spaces, memberships, accounts, documents } = this.deps;
+    return structuredClone({ persons, spaces, memberships, accounts: accounts.filter((account) => !this.deps.cards.some((card) => card.accountId === account.id)), documents });
+  }
+
+  /** Relit le référentiel si la dernière relecture date d'au moins une seconde. Rend vrai si elle a eu lieu. */
+  private async refreshOnMiss(): Promise<boolean> {
+    if (Date.now() - this.lastRefresh < REFRESH_ON_MISS_MS) return false;
+    await this.refresh();
+    return true;
+  }
+
   /** Pour la connexion : la personne qui porte ce NIN (casse et espaces ignorés), ou rien. */
   personByNin(nin: string): Person | undefined {
     const wanted = normalizeNin(nin);
     return wanted ? this.deps.persons.find((person) => normalizeNin(person.nin) === wanted) : undefined;
+  }
+
+  /** Comme `personByNin`, en relisant le référentiel si la personne n'est pas dans la copie de travail. */
+  async findPersonByNin(nin: string): Promise<Person | undefined> {
+    return this.personByNin(nin) ?? (await this.refreshOnMiss() ? this.personByNin(nin) : undefined);
+  }
+
+  // ── Inscription et membres ─────────────────────────────────────────────────
+
+  /** Contrôle une demande d'inscription et la rend sous sa forme gardée. Ne crée rien. */
+  checkRegistration(input: Partial<RegistrationInput> | undefined): RegistrationInput {
+    const nin = normalizeNin(typeof input?.nin === 'string' ? input.nin : '');
+    if (!/^[A-Z0-9-]{6,30}$/.test(nin)) throw new AppError('invalid_request', 'NIN : 6 à 30 caractères, lettres, chiffres ou tirets');
+    const fullName = typeof input?.fullName === 'string' ? input.fullName.trim().replace(/\s+/g, ' ') : '';
+    if (fullName.length < 3 || fullName.length > 80 || !/^[\p{L}' -]+$/u.test(fullName)) throw new AppError('invalid_request', 'nom complet : 3 à 80 lettres');
+    const phone = normalizeGuineaMobile(typeof input?.phone === 'string' ? input.phone : '');
+    if (!phone) throw new AppError('invalid_request', 'numéro de mobile guinéen attendu (+224 6XX XX XX XX)');
+    return { nin, fullName, phone };
+  }
+
+  /**
+   * Inscrit une personne (numéro déjà prouvé par code SMS) avec son espace personnel. Le NIN est déclaré :
+   * il sera rapproché de l'état civil quand une source le permettra. Un NIN déjà inscrit est refusé.
+   */
+  async register(input: RegistrationInput): Promise<{ person: Person; space: CitizenSpace }> {
+    const checked = this.checkRegistration(input);
+    if (await this.findPersonByNin(checked.nin)) throw new AppError('conflict', 'ce NIN a déjà un compte : connectez-vous');
+    const id = randomId();
+    const person: Person = { id: `per_${id}`, nin: checked.nin, fullName: checked.fullName, phone: checked.phone, identity: 'declared', registeredAt: this.now().toISOString() };
+    const space: CitizenSpace = { id: `spc_cit_${id}`, kind: 'citizen', name: checked.fullName, ownerPersonId: person.id };
+    if (!await this.directory.addPerson(person, space)) throw new AppError('conflict', 'ce NIN a déjà un compte : connectez-vous');
+    // Une relecture concurrente a pu les ramener déjà : on n'ajoute que ce qui manque.
+    if (!this.personById(person.id)) this.deps.persons.push(person);
+    if (!this.deps.spaces.some((candidate) => candidate.id === space.id)) this.deps.spaces.push(space);
+    if (!this.deps.memberships.some((candidate) => candidate.spaceId === space.id)) this.deps.memberships.push({ personId: person.id, spaceId: space.id, role: 'citizen' });
+    return { person, space };
+  }
+
+  /**
+   * Ouverture d'une organisation par l'exploitant (outil d'administration, pas l'API publique) : l'espace et son
+   * premier responsable, désigné par son NIN (il doit être inscrit).
+   */
+  async openOrganization(space: BusinessSpace | AdministrationSpace, ownerNin: string): Promise<Space> {
+    const owner = await this.findPersonByNin(ownerNin);
+    if (!owner) throw new AppError('not_found', 'aucune personne inscrite avec ce NIN');
+    if (!/^[a-z0-9_]{3,60}$/.test(space.id)) throw new AppError('invalid_request', 'identifiant d’espace : minuscules, chiffres, _');
+    if (!await this.directory.addSpace(space)) throw new AppError('conflict', 'cet espace existe déjà');
+    const membership: Membership = { personId: owner.id, spaceId: space.id, role: space.kind === 'business' ? 'business_owner' : 'admin_authorizing_officer' };
+    await this.directory.setMembership(membership);
+    if (!this.deps.spaces.some((candidate) => candidate.id === space.id)) this.deps.spaces.push(space);
+    if (!this.deps.memberships.some((candidate) => candidate.spaceId === space.id && candidate.personId === owner.id)) this.deps.memberships.push(membership);
+    return space;
+  }
+
+  /** Rattachement fait par l'exploitant (administration publique : l'ordonnateur, le comptable, le contrôle). */
+  async assignMember(spaceId: string, nin: string, role: Role): Promise<Membership> {
+    const space = this.deps.spaces.find((candidate) => candidate.id === spaceId) ?? (await this.refreshOnMiss() ? this.deps.spaces.find((candidate) => candidate.id === spaceId) : undefined);
+    if (!space || space.kind === 'citizen') throw new AppError('not_found', 'organisation introuvable');
+    const person = await this.findPersonByNin(nin);
+    if (!person) throw new AppError('not_found', 'aucune personne inscrite avec ce NIN');
+    return this.writeMembership(space, person, role);
+  }
+
+  members(actor: Actor, spaceId: string): MemberView[] {
+    this.authorize(actor, spaceId, 'members:manage');
+    return this.deps.memberships
+      .filter((membership) => membership.spaceId === spaceId)
+      .map((membership) => ({ personId: membership.personId, fullName: this.personById(membership.personId)?.fullName ?? '—', role: membership.role, roleLabel: ROLE_LABELS[membership.role] }))
+      .sort((a, b) => a.fullName.localeCompare(b.fullName, 'fr'));
+  }
+
+  /** Ajoute une personne inscrite à l'organisation, ou change son rôle. Le responsable ne change pas le sien. */
+  async addMember(actor: Actor, spaceId: string, input: { nin?: unknown; role?: unknown } | undefined): Promise<MemberView> {
+    const { space } = this.authorize(actor, spaceId, 'members:manage');
+    const role = input?.role;
+    if (typeof role !== 'string' || !(role in ROLE_SPACE_KIND) || ROLE_SPACE_KIND[role as Role] !== space.kind) {
+      throw new AppError('invalid_request', 'rôle inconnu pour ce type d’espace');
+    }
+    const person = typeof input?.nin === 'string' ? await this.findPersonByNin(input.nin) : undefined;
+    // La personne doit d'abord s'inscrire elle-même : son numéro est ainsi prouvé.
+    if (!person) throw new AppError('not_found', 'aucune personne inscrite avec ce NIN : elle doit d’abord s’inscrire sur App GN');
+    if (person.id === actor.personId) throw new AppError('invalid_request', 'vous ne pouvez pas changer votre propre rôle');
+    const membership = await this.writeMembership(space, person, role as Role);
+    return { personId: person.id, fullName: person.fullName, role: membership.role, roleLabel: ROLE_LABELS[membership.role] };
+  }
+
+  async removeMember(actor: Actor, spaceId: string, personId: string): Promise<void> {
+    this.authorize(actor, spaceId, 'members:manage');
+    if (personId === actor.personId) throw new AppError('invalid_request', 'vous ne pouvez pas vous retirer vous-même');
+    const membership = this.deps.memberships.find((candidate) => candidate.spaceId === spaceId && candidate.personId === personId);
+    if (!membership) throw new AppError('not_found', 'cette personne n’est pas membre');
+    await this.directory.removeMembership(personId, spaceId);
+    this.deps.memberships.splice(this.deps.memberships.indexOf(membership), 1);
+  }
+
+  private async writeMembership(space: Space, person: Person, role: Role): Promise<Membership> {
+    if (ROLE_SPACE_KIND[role] !== space.kind || space.kind === 'citizen') throw new AppError('invalid_request', 'rôle inconnu pour ce type d’espace');
+    const membership: Membership = { personId: person.id, spaceId: space.id, role };
+    await this.directory.setMembership(membership);
+    const index = this.deps.memberships.findIndex((candidate) => candidate.personId === person.id && candidate.spaceId === space.id);
+    if (index >= 0) this.deps.memberships[index] = membership;
+    else this.deps.memberships.push(membership);
+    return membership;
   }
 
   me(actor: Actor): MeView {
@@ -499,12 +657,13 @@ export class AppGn {
    * Remet un document émis par une organisation (attestation de travail…) dans le coffre personnel de la
    * personne qui porte ce NIN. Rien n'est rendu à l'émetteur : il n'apprend pas si la personne utilise App GN.
    */
-  depositIssuedDocument(nin: string, document: Omit<VaultDocument, 'spaceId'>): void {
-    const person = this.personByNin(nin);
+  async depositIssuedDocument(nin: string, document: Omit<VaultDocument, 'spaceId'>): Promise<void> {
+    const person = await this.findPersonByNin(nin);
     if (!person) return;
     const space = this.deps.spaces.find((candidate) => candidate.kind === 'citizen' && candidate.ownerPersonId === person.id);
     if (!space || this.deps.documents.some((candidate) => candidate.id === document.id)) return;
-    this.deps.documents.push({ ...document, spaceId: space.id, holderName: person.fullName });
+    const deposited: VaultDocument = { ...document, spaceId: space.id, holderName: person.fullName };
+    if (await this.directory.addDocument(deposited)) this.deps.documents.push(deposited);
   }
 
   /** Vérifie qu'un document émis par une organisation est connu (pour le code de vérification public). */
@@ -666,6 +825,14 @@ export class AppGn {
   }
 }
 
+function replace<T>(target: T[], items: readonly T[]): void {
+  target.splice(0, target.length, ...items);
+}
+
+function randomId(): string {
+  return globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+}
+
 function rankValidity(document: DocumentView): number {
   return { expired: 0, expiring: 1, valid: 2, no_expiry: 3 }[document.validity];
 }
@@ -678,16 +845,31 @@ function defaultLabel(destination: PaymentDestination): string {
   }
 }
 
-export function normalizeNin(nin: string): string {
-  return typeof nin === 'string' ? nin.toUpperCase().replace(/\s+/g, '') : '';
-}
-
 export interface DemoOptions {
   now?: () => Date;
   aggregationTimeoutMs?: number;
   /** Remplace l'orchestrateur simulé (par ORCHEA, côté serveur), construit sur le même réseau simulé. */
   orchestrator?: (network: SimulatedNetwork, now: () => Date) => PaymentOrchestrator;
   store?: AppStore;
+  /** Référentiel en base (serveur). Sans lui, le référentiel de démonstration reste en mémoire. */
+  directory?: DirectoryStore;
+  /** Verser le référentiel de démonstration dans un `directory` vide (oui par défaut ; jamais en production). */
+  seedDirectory?: boolean;
+}
+
+/**
+ * Verse un référentiel dans un magasin. Rejouable : ce qui existe déjà est laissé tel quel, ce qui peut arriver
+ * quand deux instances démarrent ensemble sur une base vide.
+ */
+export async function seedDirectory(store: DirectoryStore, directory: Directory): Promise<void> {
+  for (const person of directory.persons) {
+    const space = directory.spaces.find((candidate): candidate is CitizenSpace => candidate.kind === 'citizen' && candidate.ownerPersonId === person.id);
+    if (space) await store.addPerson(person, space);
+  }
+  for (const space of directory.spaces) if (space.kind !== 'citizen') await store.addSpace(space);
+  for (const membership of directory.memberships) if (membership.role !== 'citizen') await store.setMembership(membership);
+  for (const account of directory.accounts) await store.addAccount(account);
+  for (const document of directory.documents) await store.addDocument(document);
 }
 
 /** Monte une instance complète sur données fictives : réseau simulé, un connecteur simulé par fournisseur. */
@@ -708,6 +890,7 @@ export function createDemoApp(options: DemoOptions = {}): { app: AppGn; network:
     now,
     aggregationTimeoutMs: options.aggregationTimeoutMs,
     store: options.store,
+    directory: options.directory,
   });
   return { app, network };
 }
@@ -715,6 +898,11 @@ export function createDemoApp(options: DemoOptions = {}): { app: AppGn; network:
 /** Comme `createDemoApp`, puis reprend l'état du magasin (cartes émises) et rouvre leurs comptes sur le réseau simulé. */
 export async function loadDemoApp(options: DemoOptions = {}): Promise<{ app: AppGn; network: SimulatedNetwork }> {
   const demo = createDemoApp(options);
+  if (options.directory) {
+    const current = await options.directory.load();
+    if (current.persons.length === 0 && options.seedDirectory !== false) await seedDirectory(options.directory, demo.app.snapshot());
+    await demo.app.refresh();
+  }
   for (const account of await demo.app.load()) demo.network.open(account, []);
   return demo;
 }

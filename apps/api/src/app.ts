@@ -102,6 +102,10 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
     });
     server.post<{ Body: { selectionToken?: unknown; spaceId?: unknown } }>('/v1/auth/sessions/space', async (request, reply) =>
       opened(request, reply, await auth.selectSpace(request.body?.selectionToken, request.body?.spaceId)));
+    // Inscription : NIN, nom, numéro ; puis le code reçu par SMS. La personne entre dans son espace personnel.
+    server.post('/v1/registrations', async (request, reply) => reply.status(202).send(await auth.requestRegistration(request.body)));
+    server.post<{ Body: { challengeId?: unknown; code?: unknown } }>('/v1/registrations/confirm', async (request, reply) =>
+      opened(request, reply, await auth.confirmRegistration(request.body?.challengeId, request.body?.code)));
     server.delete('/v1/auth/sessions/current', async (request, reply) => {
       const bearer = /^Bearer (\S+)$/.exec(request.headers.authorization ?? '')?.[1];
       const session = bearer ? await auth.read(bearer) : undefined;
@@ -137,6 +141,18 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
 
   server.post<{ Params: { spaceId: string; paymentId: string }; Body: { reason?: string } | undefined }>('/v1/spaces/:spaceId/payments/:paymentId/reject', async (request) =>
     app.rejectPayment(await actorOf(request), request.params.spaceId, request.params.paymentId, request.body?.reason));
+
+  // Membres d'une organisation (dirigeant d'entreprise) : une personne déjà inscrite, désignée par son NIN.
+  server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/members', async (request) =>
+    app.members(await actorOf(request), request.params.spaceId));
+
+  server.post<{ Params: { spaceId: string }; Body: { nin?: unknown; role?: unknown } }>('/v1/spaces/:spaceId/members', async (request, reply) =>
+    reply.status(201).send(await app.addMember(await actorOf(request), request.params.spaceId, request.body)));
+
+  server.delete<{ Params: { spaceId: string; personId: string } }>('/v1/spaces/:spaceId/members/:personId', async (request, reply) => {
+    await app.removeMember(await actorOf(request), request.params.spaceId, request.params.personId);
+    return reply.status(204).send();
+  });
 
   server.get<{ Params: { spaceId: string } }>('/v1/spaces/:spaceId/documents', async (request) =>
     app.documents(await actorOf(request), request.params.spaceId));
