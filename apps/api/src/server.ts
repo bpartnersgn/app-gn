@@ -2,7 +2,15 @@ import { DEMO_WALLET_NUMBERS, loadDemoApp, loadDemoGapp, SimulatedOrchestrator }
 import { buildServer } from './app.ts';
 import { Auth, MemorySmsSender, sessionSecretFromEnvironment } from './auth.ts';
 import { databaseFromEnvironment } from './db/connect.ts';
+import { MemoryRateLimitStore, productionProblems, securityFromEnvironment, trustProxyFromEnvironment } from './security.ts';
 import { OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromEnvironment } from './orchea.ts';
+
+// En production, refuser de démarrer plutôt que de tourner ouvert (démo, secret, base, origines, SMS).
+const problems = productionProblems(process.env);
+if (problems.length > 0) {
+  console.error(`APPGN_ENV=production : démarrage refusé.\n- ${problems.join('\n- ')}`);
+  process.exit(1);
+}
 
 const port = Number(process.env.PORT ?? 3100);
 const host = process.env.HOST ?? '127.0.0.1';
@@ -38,6 +46,8 @@ const server = buildServer(app, {
   auth,
   demoLogin,
   gapp,
+  security: securityFromEnvironment(process.env, database?.store ?? new MemoryRateLimitStore()),
+  trustProxy: trustProxyFromEnvironment(process.env.APPGN_TRUST_PROXY),
   ...(orchea ? { orcheaWebhooks: new OrcheaWebhookReceiver(app, orchea.webhookSecrets, { processed: database?.store }) } : {}),
 });
 if (database) server.addHook('onClose', database.close);

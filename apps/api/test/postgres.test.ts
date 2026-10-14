@@ -3,7 +3,7 @@ import { after, before, describe, it } from 'node:test';
 import { PGlite } from '@electric-sql/pglite';
 import { loadDemoApp, loadDemoGapp, type Actor } from '@app-gn/core';
 import { Auth, MemorySmsSender } from '../src/auth.ts';
-import { migrate, PostgresStore, type Sql } from '../src/db/postgres-store.ts';
+import { loadMigrations, migrate, PostgresStore, type Sql } from '../src/db/postgres-store.ts';
 import { OrcheaWebhookReceiver, signOrcheaWebhook } from '../src/orchea.ts';
 
 // PostgreSQL embarqué (PGlite) par défaut : même moteur, même SQL qu'en service, sans serveur à lancer.
@@ -21,6 +21,10 @@ before(async () => {
     await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
     sql = pool as unknown as Sql;
     close = () => pool.end();
+    // Une migration tient dans une transaction : elle demande une seule connexion, pas le pool.
+    const client = await pool.connect();
+    await migrate(client as unknown as Sql);
+    client.release();
   } else {
     const database = new PGlite();
     sql = database as unknown as Sql;
@@ -41,7 +45,34 @@ describe('PostgreSQL', () => {
   it('le schéma se rejoue sans erreur', async () => {
     await migrate(sql);
     const { rows } = await sql.query<{ version: number }>('SELECT version FROM schema_version');
-    assert.deepEqual(rows.map((row) => row.version), [1, 2]);
+    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3]);
+  });
+
+  it('une base déjà en version 2 ne reçoit que les migrations suivantes ; une migration qui échoue ne laisse rien', async () => {
+    const { PGlite } = await import('@electric-sql/pglite');
+    const database = new PGlite();
+    const local = database as unknown as Sql;
+    try {
+      const migrations = await loadMigrations();
+      assert.deepEqual(await migrate(local, migrations.slice(0, 2)), [1, 2]);
+      assert.deepEqual(await migrate(local, migrations), [3]);
+      assert.deepEqual(await migrate(local, migrations), []);
+      const broken = { version: 4, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
+      await assert.rejects(migrate(local, [...migrations, broken]), /migration 4 \(essai\)/);
+      const { rows } = await local.query<{ found: string | null }>("SELECT to_regclass('essai_rollback')::text AS found");
+      assert.equal(rows[0]?.found, null);
+      const versions = await local.query<{ version: number }>('SELECT version FROM schema_version ORDER BY version');
+      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('les compteurs de débit sont partagés et repartent à chaque minute', async () => {
+    const other = new PostgresStore(sql);
+    assert.deepEqual(await store.hit(['ip:essai', 's:essai'], 1000), [1, 1]);
+    assert.deepEqual(await other.hit(['ip:essai'], 1000), [2]);
+    assert.deepEqual(await store.hit(['ip:essai'], 1001), [1]);
   });
 
   it('un paiement et sa clé d’idempotence survivent à un redémarrage', async () => {

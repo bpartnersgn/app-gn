@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import type { Auth, Session } from './auth.ts';
 import { registerGappRoutes } from './gapp-routes.ts';
 import type { OrcheaWebhookReceiver } from './orchea.ts';
+import { registerSecurity, type SecurityOptions } from './security.ts';
 import { AppError, isChannel, type Actor, type Channel, type AppGn, type CardNetwork, type CardTier, type Currency, type ExchangeInput, type Gapp, type PaymentInput } from '@app-gn/core';
 
 /**
@@ -44,16 +45,24 @@ export interface ServerOptions {
   demoLogin?: boolean;
   /** Tableaux de bord GAPP (entreprise, administration). */
   gapp?: Gapp;
+  /** En-têtes, origines admises, limitation de débit (security.ts). */
+  security?: SecurityOptions;
+  /** Derrière un répartiteur : adresses des relais de confiance (ou `true`), pour lire la vraie adresse du client. */
+  trustProxy?: boolean | string[];
 }
 
 export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyInstance {
-  const server = Fastify({ logger: options.logger ?? false });
+  // Les corps attendus sont de petits JSON : au-delà de 256 Ko, la requête est refusée avant d'être lue.
+  const server = Fastify({ logger: options.logger ?? false, bodyLimit: 256 * 1024, trustProxy: options.trustProxy ?? false });
+  if (options.security) registerSecurity(server, options.security);
   const auth = options.auth;
   const demoLogin = options.demoLogin ?? true;
   const actorOf = (request: FastifyRequest) => resolveActor(request, auth, demoLogin);
 
-  server.setErrorHandler((error, _request, reply: FastifyReply) => {
+  server.setErrorHandler((error, request, reply: FastifyReply) => {
     if (error instanceof AppError) {
+      // Journal de sécurité : qui est refusé et où, sans corps ni jeton.
+      if (error.status === 401 || error.status === 403) request.log.warn({ code: error.code, method: request.method, route: request.routeOptions.url }, 'accès refusé');
       return reply.status(error.status).send({ error: error.code, message: error.message });
     }
     const status = typeof (error as { statusCode?: number }).statusCode === 'number' ? (error as { statusCode: number }).statusCode : 500;

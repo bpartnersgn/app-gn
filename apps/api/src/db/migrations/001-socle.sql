@@ -1,10 +1,5 @@
--- Schéma App GN. Rejouable : chaque instruction ne crée que ce qui manque.
+-- Migration 1 : socle (paiements, idempotence, conversions, cartes, webhooks traités, connexion).
 -- Les objets métier sont gardés en JSONB (forme exacte du noyau), avec en colonnes ce qui sert à chercher et à verrouiller.
-
-CREATE TABLE IF NOT EXISTS schema_version (
-  version integer PRIMARY KEY,
-  applied_at timestamptz NOT NULL DEFAULT now()
-);
 
 CREATE TABLE IF NOT EXISTS payments (
   id text PRIMARY KEY,
@@ -62,20 +57,3 @@ CREATE TABLE IF NOT EXISTS revoked_sessions (
   session_id text PRIMARY KEY,
   until bigint NOT NULL
 );
-
-INSERT INTO schema_version (version) VALUES (1) ON CONFLICT DO NOTHING;
-
--- Version 2 : bureaux GAPP (factures, fournisseurs, lots, TVA, équipe, budget, engagements, agents, audit).
--- Un enregistrement par objet, versionné : toute mise à jour vérifie la version lue (écriture conditionnelle).
-CREATE TABLE IF NOT EXISTS desk_records (
-  collection text NOT NULL,
-  id text NOT NULL,
-  space_id text NOT NULL,
-  version integer NOT NULL,
-  seq bigserial,
-  document jsonb NOT NULL,
-  PRIMARY KEY (collection, id)
-);
-CREATE INDEX IF NOT EXISTS desk_records_space ON desk_records (collection, space_id, seq);
-
-INSERT INTO schema_version (version) VALUES (2) ON CONFLICT DO NOTHING;

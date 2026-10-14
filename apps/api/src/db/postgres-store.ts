@@ -1,7 +1,8 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import type { AppStore, DeskCollection, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
 import type { AuthStore, Challenge } from '../auth.ts';
 import type { ProcessedEvents } from '../orchea.ts';
+import type { RateLimitStore } from '../security.ts';
 
 /**
  * Ce que le magasin attend d'une connexion PostgreSQL : `pg.Pool` en service, PGlite (PostgreSQL embarqué) en test.
@@ -12,22 +13,64 @@ export interface Sql {
   query<Row = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: Row[] }>;
 }
 
-/** Applique le schéma (rejouable). */
-export async function migrate(sql: Sql): Promise<void> {
-  const schema = await readFile(new URL('./schema.sql', import.meta.url), 'utf8');
-  const statements = schema
-    .split('\n')
-    .filter((line) => !line.trimStart().startsWith('--'))
-    .join('\n')
-    .split(/;\s*\n/)
-    .map((statement) => statement.trim())
-    .filter(Boolean);
-  for (const statement of statements) await sql.query(statement);
+/** Une migration numérotée : `migrations/NNN-nom.sql`. */
+export interface Migration {
+  version: number;
+  name: string;
+  statements: string[];
+}
+
+export async function loadMigrations(): Promise<Migration[]> {
+  const directory = new URL('./migrations/', import.meta.url);
+  const files = (await readdir(directory)).filter((file) => /^\d{3}-[\w-]+\.sql$/.test(file)).sort();
+  const migrations: Migration[] = [];
+  for (const file of files) {
+    const text = await readFile(new URL(file, directory), 'utf8');
+    const statements = text
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n')
+      .split(/;\s*\n/)
+      .map((statement) => statement.trim().replace(/;$/, ''))
+      .filter(Boolean);
+    migrations.push({ version: Number(file.slice(0, 3)), name: file.slice(4, -4), statements });
+  }
+  migrations.forEach((migration, index) => {
+    if (migration.version !== index + 1) throw new Error(`migrations : ${migration.version} au lieu de ${index + 1} (numéros contigus exigés)`);
+  });
+  return migrations;
+}
+
+/**
+ * Applique, dans l'ordre, les migrations pas encore passées, chacune dans sa transaction avec son inscription
+ * dans `schema_version`. `sql` doit être une seule connexion (client dédié ou PGlite), pas un pool : c'est ce qui
+ * tient la transaction. Rend les versions appliquées par cet appel.
+ */
+export async function migrate(sql: Sql, migrations?: readonly Migration[]): Promise<number[]> {
+  const all = migrations ?? await loadMigrations();
+  await sql.query('CREATE TABLE IF NOT EXISTS schema_version (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())');
+  const { rows } = await sql.query<{ version: number }>('SELECT version FROM schema_version');
+  const done = new Set(rows.map((row) => Number(row.version)));
+  const applied: number[] = [];
+  for (const migration of all) {
+    if (done.has(migration.version)) continue;
+    await sql.query('BEGIN');
+    try {
+      for (const statement of migration.statements) await sql.query(statement);
+      await sql.query('INSERT INTO schema_version (version) VALUES ($1)', [migration.version]);
+      await sql.query('COMMIT');
+    } catch (error) {
+      await sql.query('ROLLBACK');
+      throw new Error(`migration ${migration.version} (${migration.name}) : ${(error as Error).message}`, { cause: error });
+    }
+    applied.push(migration.version);
+  }
+  return applied;
 }
 
 type Json<T> = { document: T };
 
-export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore {
+export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore, RateLimitStore {
   private readonly sql: Sql;
   constructor(sql: Sql) {
     this.sql = sql;
@@ -212,4 +255,25 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, Desk
     );
     return rows.length === 1;
   }
+
+  // ── Limitation de débit ──
+
+  private lastPrune = 0;
+
+  /** Une seule instruction pour toutes les clés : chacune est créée ou incrémentée, et son total rendu. */
+  async hit(keys: readonly string[], window: number): Promise<number[]> {
+    if (keys.length === 0) return [];
+    const values = keys.map((_, index) => `($${index + 2}, $1, 1)`).join(', ');
+    const { rows } = await this.sql.query<{ key: string; count: number }>(
+      `INSERT INTO rate_limits (key, window_start, count) VALUES ${values} ON CONFLICT (key, window_start) DO UPDATE SET count = rate_limits.count + 1 RETURNING key, count`,
+      [window, ...keys],
+    );
+    if (window > this.lastPrune) {
+      this.lastPrune = window;
+      await this.sql.query('DELETE FROM rate_limits WHERE window_start < $1', [window - 1]);
+    }
+    const counts = new Map(rows.map((row) => [row.key, Number(row.count)]));
+    return keys.map((key) => counts.get(key) ?? 0);
+  }
+
 }
