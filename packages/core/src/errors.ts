@@ -11,7 +11,8 @@ export type ErrorCode =
   | 'channel_not_allowed'
   | 'rate_limited'
   | 'conflict'
-  | 'confirmation_required';
+  | 'confirmation_required'
+  | 'unavailable';
 
 const STATUS: Record<ErrorCode, number> = {
   unauthenticated: 401,
@@ -27,6 +28,8 @@ const STATUS: Record<ErrorCode, number> = {
   rate_limited: 429,
   conflict: 409,
   confirmation_required: 428,
+  /** Un fournisseur extérieur (SMS, opérateur) ne répond pas : l'appelant peut réessayer. */
+  unavailable: 503,
 };
 
 export class AppError extends Error {

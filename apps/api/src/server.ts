@@ -1,6 +1,7 @@
 import { DEMO_WALLET_NUMBERS, loadDemoApp, loadDemoGapp, SimulatedOrchestrator } from '@app-gn/core';
 import { buildServer } from './app.ts';
-import { Auth, MemorySmsSender, sessionSecretFromEnvironment } from './auth.ts';
+import { Auth, sessionSecretFromEnvironment } from './auth.ts';
+import { smsFromEnvironment } from './sms.ts';
 import { databaseFromEnvironment } from './db/connect.ts';
 import { MemoryRateLimitStore, productionProblems, securityFromEnvironment, trustProxyFromEnvironment } from './security.ts';
 import { OrcheaEventFeed, OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromEnvironment } from './orchea.ts';
@@ -9,6 +10,15 @@ import { OrcheaEventFeed, OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromE
 const problems = productionProblems(process.env);
 if (problems.length > 0) {
   console.error(`APPGN_ENV=production : démarrage refusé.\n- ${problems.join('\n- ')}`);
+  process.exit(1);
+}
+
+// Envoi des SMS : Orange (APPGN_SMS_PROVIDER=orange) ou, sans fournisseur, gardés en mémoire.
+let sms: ReturnType<typeof smsFromEnvironment>;
+try {
+  sms = smsFromEnvironment(process.env);
+} catch (error) {
+  console.error((error as Error).message);
   process.exit(1);
 }
 
@@ -46,11 +56,10 @@ const refresher = database && refreshEvery > 0
   ? setInterval(() => void app.refresh().catch((error: unknown) => console.error('relecture du référentiel', error)), refreshEvery).unref()
   : undefined;
 
-// Connexion par NIN + code SMS. Aucun fournisseur SMS n'est branché : en démonstration (APPGN_DEMO_LOGIN,
-// activée par défaut), la réponse porte le code ; APPGN_DEMO_LOGIN=off ferme la connexion de démo et le code affiché.
+// Connexion par NIN + code SMS. En démonstration (APPGN_DEMO_LOGIN, activée par défaut), la réponse porte aussi le code ; APPGN_DEMO_LOGIN=off ferme la connexion de démo et le code affiché.
 const demoLogin = process.env.APPGN_DEMO_LOGIN !== 'off';
 const sessionSecret = sessionSecretFromEnvironment(process.env);
-const auth = new Auth({ app, sms: new MemorySmsSender(), secret: sessionSecret.secret, revealCodes: demoLogin, store: database?.store });
+const auth = new Auth({ app, sms: sms.sender, secret: sessionSecret.secret, revealCodes: demoLogin, store: database?.store });
 // Les codes de confirmation forte (au-delà de 5 M GNF) partent par le même canal que ceux de connexion. Les données de
 // démonstration ont été versées avant, avec des codes rendus à l'écran.
 app.useConfirmer(auth);
@@ -85,6 +94,8 @@ if (feed) {
 }
 await server.listen({ port, host });
 server.log.info({ database: database?.kind ?? 'mémoire' }, 'stockage');
+if (sms.provider === 'memory') server.log.warn('aucun fournisseur SMS (APPGN_SMS_PROVIDER) : les codes ne partent pas, ils restent en mémoire');
+else server.log.info({ provider: sms.provider }, 'envoi des SMS');
 if (orchea) server.log.info({ baseUrl: orchea.config.baseUrl, mode: orchea.config.mode ?? 'live' }, 'paiements de factures via ORCHEA');
 if (sessionSecret.generated) server.log.warn('APPGN_SESSION_SECRET absente : clé tirée au démarrage, les sessions ne survivront pas à un redémarrage');
 if (demoLogin) server.log.warn('connexion de démonstration ouverte (APPGN_DEMO_LOGIN=off pour la fermer)');
