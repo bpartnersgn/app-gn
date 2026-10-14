@@ -43,7 +43,7 @@ export class MemoryRateLimitStore implements RateLimitStore {
   }
 }
 
-const ALLOWED_HEADERS = 'authorization, content-type, idempotency-key, appgn-channel';
+const ALLOWED_HEADERS = 'authorization, content-type, idempotency-key, appgn-channel, appgn-confirmation';
 const ALLOWED_METHODS = 'GET, POST, DELETE';
 const WRITES = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 /** Routes que la limitation ne compte pas : sonde de l'hébergeur, webhooks signés d'ORCHEA. */

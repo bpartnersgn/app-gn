@@ -43,7 +43,15 @@ describe('API GAPP', () => {
     assert.equal(bill.statusCode, 201);
     const batch = await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/business/batches', headers: { ...alpha, 'idempotency-key': 'l-1' }, payload: { billIds: [bill.json().id], sourceAccountId: 'acc_bl_om' } });
     assert.equal(batch.json().status, 'pending_approval');
-    const approved = await server.inject({ method: 'POST', url: `/v1/spaces/spc_biz_boke/business/batches/${batch.json().id}/approve`, headers: as('per_sekou', 'spc_biz_boke') });
+    const url = `/v1/spaces/spc_biz_boke/business/batches/${batch.json().id}/approve`;
+    // Au-delà du seuil : 428 et un code (rendu ici, démonstration), puis la même demande avec le code.
+    const asked = await server.inject({ method: 'POST', url, headers: as('per_sekou', 'spc_biz_boke') });
+    assert.equal(asked.statusCode, 428);
+    assert.equal(asked.json().error, 'confirmation_required');
+    const { challengeId, demoCode } = asked.json().confirmation;
+    assert.equal((await server.inject({ method: 'POST', url, headers: { ...as('per_sekou', 'spc_biz_boke'), 'appgn-confirmation': 'mauvais' } })).statusCode, 400);
+    const approved = await server.inject({ method: 'POST', url, headers: { ...as('per_sekou', 'spc_biz_boke'), 'appgn-confirmation': `${challengeId}.${demoCode}` } });
+    assert.equal(approved.statusCode, 200);
     assert.equal(approved.json().status, 'executed');
 
     const ledger = await server.inject({ method: 'GET', url: '/v1/spaces/spc_biz_boke/business/ledger/2026-10', headers: alpha });

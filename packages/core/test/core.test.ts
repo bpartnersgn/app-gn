@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { AppError, convert, createDemoApp, formatMoney, MemoryStore, money, Outbox, parseMajor, SnapshotCache, toReference, type Actor, type Channel } from '../src/index.ts';
+import { AppError, convert, withDemoConfirmation, createDemoApp, formatMoney, MemoryStore, money, Outbox, parseMajor, SnapshotCache, toReference, type Actor, type Channel } from '../src/index.ts';
 
 const fixedNow = () => new Date('2026-10-12T10:00:00Z');
 const A = (personId: string, channel: Channel = 'desktop'): Actor => ({ personId, channel });
@@ -163,9 +163,37 @@ describe('paiements', () => {
     }, 'k4');
     assert.equal(large.status, 'pending_approval');
     await rejects(app.approvePayment(A('per_alpha'), 'spc_biz_boke', large.id), 'forbidden');
-    const approved = await app.approvePayment(A('per_sekou'), 'spc_biz_boke', large.id);
+    const approved = await withDemoConfirmation(A('per_sekou'), (actor) => app.approvePayment(actor, 'spc_biz_boke', large.id));
     assert.equal(approved.status, 'completed');
     assert.equal(approved.decidedBy, 'per_sekou');
+  });
+
+  it('entreprise : au-delà du seuil, qui fait partir l’argent confirme par un code lié à l’opération', async () => {
+    const { app } = demo();
+    const sekou = A('per_sekou');
+    const input = { sourceAccountId: 'acc_bl_eco', amount: '9000000', destination: { type: 'own_account' as const, accountId: 'acc_bl_uba' } };
+    const asked = await app.initiatePayment(sekou, 'spc_biz_boke', input, 'c1').catch((error: AppError) => error);
+    assert.ok(asked instanceof AppError);
+    assert.equal(asked.code, 'confirmation_required');
+    assert.equal(asked.status, 428);
+    const challenge = asked.details!.confirmation as { challengeId: string; demoCode: string; sentTo: string; summary: string };
+    assert.equal(challenge.sentTo, '•• •• 05');
+    assert.match(challenge.summary, /9\s000\s000 GNF/);
+    // Rien n'est créé tant que le code n'est pas donné ; la clé d'idempotence reste libre.
+    assert.equal((await app.listPayments(sekou, 'spc_biz_boke')).filter((payment) => payment.amount.amount === '9000000').length, 0);
+    // Le code d'une opération ne vaut pas pour une autre (autre montant, même clé).
+    const other = await app.initiatePayment({ ...sekou, confirmation: { challengeId: challenge.challengeId, code: challenge.demoCode } }, 'spc_biz_boke', { ...input, amount: '9500000' }, 'c1').catch((error: AppError) => error);
+    assert.equal((other as AppError).code, 'confirmation_required');
+    assert.match((other as AppError).message, /code incorrect/);
+    const fresh = (other as AppError).details!.confirmation as { challengeId: string; demoCode: string };
+    const paid = await app.initiatePayment({ ...sekou, confirmation: { challengeId: fresh.challengeId, code: fresh.demoCode } }, 'spc_biz_boke', { ...input, amount: '9500000' }, 'c1');
+    assert.equal(paid.status, 'completed');
+    // Un code sert une fois.
+    const reused = await app.initiatePayment({ ...sekou, confirmation: { challengeId: fresh.challengeId, code: fresh.demoCode } }, 'spc_biz_boke', input, 'c2').catch((error: AppError) => error);
+    assert.equal((reused as AppError).code, 'confirmation_required');
+    // Sous le seuil, et dans l'espace personnel, aucun code.
+    assert.equal((await app.initiatePayment(sekou, 'spc_biz_boke', { ...input, amount: '4999999' }, 'c3')).status, 'completed');
+    assert.equal((await app.initiatePayment(A('per_mariama'), 'spc_cit_mariama', { sourceAccountId: 'acc_mc_om', amount: '1000', destination: { type: 'own_account', accountId: 'acc_mc_mtn' } }, 'c4')).status, 'completed');
   });
 
   it('administration : l’ordonnateur mandate, le comptable public paie ou rejette', async () => {

@@ -10,7 +10,8 @@ export type ErrorCode =
   | 'separation_of_duties'
   | 'channel_not_allowed'
   | 'rate_limited'
-  | 'conflict';
+  | 'conflict'
+  | 'confirmation_required';
 
 const STATUS: Record<ErrorCode, number> = {
   unauthenticated: 401,
@@ -25,14 +26,18 @@ const STATUS: Record<ErrorCode, number> = {
   channel_not_allowed: 403,
   rate_limited: 429,
   conflict: 409,
+  confirmation_required: 428,
 };
 
 export class AppError extends Error {
   readonly code: ErrorCode;
   readonly status: number;
-  constructor(code: ErrorCode, message: string) {
+  /** Ce que l'appelant doit savoir pour continuer (le défi d'une confirmation forte). */
+  readonly details?: Record<string, unknown>;
+  constructor(code: ErrorCode, message: string, details?: Record<string, unknown>) {
     super(message);
     this.code = code;
     this.status = STATUS[code];
+    if (details) this.details = details;
   }
 }

@@ -4,6 +4,7 @@ import {
   createDemoApp,
   loadDemoGapp,
   MemoryDeskStore,
+  withDemoConfirmation,
   type Actor,
   type SalesInvoice,
   type SupplierBill,
@@ -118,12 +119,15 @@ describe('GAPP Entreprise : fournisseurs et lots de paiement', () => {
     const pending = (await business.batches(sekou, BOKE)).find((batch) => batch.status === 'pending_approval')!;
     assert.equal(pending.total.amount, '28000000');
     await assert.rejects(business.approveBatch(alpha, BOKE, pending.id), { code: 'forbidden' });
-    const approved = await business.approveBatch(sekou, BOKE, pending.id);
+    // Sans code, rien ne part ; avec le code reçu par SMS, le lot est payé.
+    await assert.rejects(business.approveBatch(sekou, BOKE, pending.id), { code: 'confirmation_required' });
+    assert.equal((await business.batches(sekou, BOKE)).find((batch) => batch.id === pending.id)!.status, 'pending_approval');
+    const approved = await withDemoConfirmation(sekou, (actor) => business.approveBatch(actor, BOKE, pending.id));
     assert.equal(approved.status, 'executed');
     assert.deepEqual(approved.counts, { completed: 2, processing: 0, failed: 0, pending: 0 });
     const bills = await business.bills(alpha, BOKE);
     assert.deepEqual(bills.filter((candidate) => candidate.state === 'paid').map((candidate) => candidate.reference).sort(), ['GM-2231', 'PCI-778', 'SKC-0912']);
-    await assert.rejects(business.approveBatch(sekou, BOKE, pending.id), { code: 'invalid_state' });
+    await assert.rejects(withDemoConfirmation(sekou, (actor) => business.approveBatch(actor, BOKE, pending.id)), { code: 'invalid_state' });
   });
 
   it('le dirigeant qui prépare un lot le paie tout de suite ; deux approbations simultanées n’en passent qu’une', async () => {
@@ -131,7 +135,7 @@ describe('GAPP Entreprise : fournisseurs et lots de paiement', () => {
     const created = await business.recordBill(alpha, BOKE, bill('X-1', '7000000'), 'b1');
     const batch = await business.createSupplierBatch(alpha, BOKE, { billIds: [created.id], sourceAccountId: 'acc_bl_om' }, 'lot-x');
     assert.equal(batch.status, 'pending_approval');
-    const [one, two] = await Promise.allSettled([business.approveBatch(sekou, BOKE, batch.id), business.approveBatch(sekou, BOKE, batch.id)]);
+    const [one, two] = await Promise.allSettled([withDemoConfirmation(sekou, (actor) => business.approveBatch(actor, BOKE, batch.id)), withDemoConfirmation(sekou, (actor) => business.approveBatch(actor, BOKE, batch.id))]);
     assert.equal([one, two].filter((result) => result.status === 'fulfilled').length, 1);
     const payments = (await app.listPayments(sekou, BOKE)).filter((payment) => payment.label === 'Fournisseur X-1 · X-1');
     assert.equal(payments.length, 1);
@@ -197,7 +201,7 @@ describe('GAPP Entreprise : TVA', () => {
     // Le mois est verrouillé : une facture de septembre ne s'annule plus.
     const september = (await business.invoices(alpha, BOKE)).invoices.find((invoice) => invoice.number === 'FAC-2026-0003')!;
     await assert.rejects(business.cancelInvoice(alpha, BOKE, september.id, 'erreur'), { code: 'invalid_state' });
-    await app.approvePayment(sekou, BOKE, filed.paymentId!);
+    await withDemoConfirmation(sekou, (actor) => app.approvePayment(actor, BOKE, filed.paymentId!));
     const done = (await business.vat(alpha, BOKE)).returns.find((value) => value.period === '2026-09')!;
     assert.equal(done.state, 'filed');
     assert.match(done.acknowledgement!, /^DGI-TVA-202609-\d{6}$/);
@@ -249,7 +253,7 @@ describe('GAPP Entreprise : équipe et paie', () => {
     assert.equal(payroll.total.amount, String(12_500_000 + 3_800_000 + 2_900_000 * 2 + 3_200_000 + 4_100_000));
     await assert.rejects(business.approveBatch(aissatou, BOKE, payroll.id), { code: 'forbidden' });
     await assert.rejects(business.preparePayroll(aissatou, BOKE, { period: '2026-10', sourceAccountId: 'acc_bl_eco' }, 'paie-10b'), { code: 'invalid_state' });
-    assert.equal((await business.approveBatch(sekou, BOKE, payroll.id)).counts.completed, 6);
+    assert.equal((await withDemoConfirmation(sekou, (actor) => business.approveBatch(actor, BOKE, payroll.id))).counts.completed, 6);
   });
 
   it('un NIN déjà au registre et une sortie avant l’embauche sont refusés', async () => {

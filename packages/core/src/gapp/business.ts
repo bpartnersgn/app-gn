@@ -1,9 +1,9 @@
 import type { AccountPosition } from '../aggregation.ts';
-import type { AppGn } from '../app.ts';
+import { fingerprintOf, type AppGn } from '../app.ts';
 import type { Actor } from '../channels.ts';
 import { AppError } from '../errors.ts';
 import type { AccountKind, BusinessSpace, LinkedAccount, Role } from '../model.ts';
-import { toBigInt, toMajor, type Money } from '../money.ts';
+import { formatMoney, toBigInt, toMajor, type Money } from '../money.ts';
 import { BUSINESS_APPROVAL_THRESHOLD, type Payment, type PaymentDestination } from '../payments.ts';
 import { providerById } from '../providers.ts';
 import { can, type Permission } from '../rbac.ts';
@@ -653,6 +653,7 @@ export class BusinessDesk {
     const batch = record.value;
     if (batch.status !== 'pending_approval') throw new AppError('invalid_state', 'lot déjà décidé');
     if (batch.initiatedBy === actor.personId) throw new AppError('separation_of_duties', 'qui prépare un lot ne l’approuve pas');
+    await this.app.confirmStrongly(actor, context.space, batch.total, `batch.approve|${batch.id}`, `l’approbation du lot ${batch.reference} : ${batch.lines.length} ligne(s), ${formatMoney(batch.total)}`);
     const claimed: PaymentBatch = { ...batch, status: 'executing', decidedBy: actor.personId, decidedAt: context.at };
     if (!await this.store.update('batches', claimed, record.version)) throw new AppError('invalid_state', 'lot déjà décidé');
     await this.record(context, actor, 'batch.approved', batch.id, `${batch.reference} approuvé · ${batch.lines.length} lignes · ${toMajor(batch.total)} GNF`);
@@ -706,6 +707,11 @@ export class BusinessDesk {
     const period = input?.period;
     this.closedPeriod(period, context.today);
     const id = `${spaceId}:${period}`;
+    // Le dirigeant qui déclare et paie lui-même au-delà du seuil confirme par code, avant toute écriture.
+    if (can(context.role, 'payments:approve')) {
+      const due = (await this.computeVat(spaceId, period)).due;
+      if (toBigInt(due) > 0n) await this.app.confirmStrongly(actor, context.space, due, `vat.file|${period}|${input?.sourceAccountId ?? ''}`, `la déclaration et le paiement de la TVA ${period} : ${formatMoney(due)}`);
+    }
     const claim = await claimKey(this.store, spaceId, actor.personId, 'vat', idempotencyKey, input, id);
     if (claim.conflict) throw new AppError('idempotency_conflict', 'cette clé a déjà servi pour une autre demande');
     const payments = await this.paymentMap(actor, spaceId);
@@ -732,7 +738,7 @@ export class BusinessDesk {
         amount: toMajor(computation.due),
         destination: { type: 'biller', billerId: 'dgi', customerReference: `NIF ${context.space.nif} · TVA ${period}` },
         label: `TVA ${period}`,
-      }, `${id}:${attempts}`);
+      }, `${id}:${attempts}`, 'desk');
       await mutate<VatReturn>(this.store, 'vat_returns', id, (current) => ({ ...current!, paymentId: payment.id }));
       draft.paymentId = payment.id;
       payments.set(payment.id, payment);
@@ -1100,6 +1106,12 @@ export class BusinessDesk {
   ): Promise<BatchView> {
     const spaceId = context.space.id;
     const id = randomId('bat');
+    const total = sum(draft.lines.map((line) => line.amount));
+    // Un lot qui part tout de suite (préparé par qui peut approuver) se confirme par code au-delà du seuil.
+    if (!batchNeedsApproval(draft.kind, total, context.role)) {
+      await this.app.confirmStrongly(actor, context.space, total, `batch.create|${draft.kind}|${idempotencyKey}|${fingerprintOf([fingerprint, draft.source.id])}`,
+        `${draft.kind === 'payroll' ? 'la paie' : 'le lot fournisseurs'} ${draft.reference} : ${draft.lines.length} ligne(s), ${formatMoney(total)}`);
+    }
     const claim = await claimKey(this.store, spaceId, actor.personId, `batch.${draft.kind}`, idempotencyKey, [fingerprint, draft.source.id], id);
     if (claim.conflict) throw new AppError('idempotency_conflict', 'cette clé a déjà servi pour une autre demande');
     if (claim.replay) {
@@ -1108,7 +1120,6 @@ export class BusinessDesk {
     }
     if (existing) throw new AppError('invalid_state', `${existing.reference} existe déjà`);
 
-    const total = sum(draft.lines.map((line) => line.amount));
     const options = await this.railOptions(actor, spaceId, draft.lines.map((line) => ({ operator: (line.destination as { operator: string }).operator, amount: line.amount })));
     const option = options.find((candidate) => candidate.accountId === draft.source.id)!;
     if (!option.balance) throw new AppError('invalid_state', 'solde du compte indisponible : réessayez ou choisissez un autre compte');
@@ -1163,7 +1174,7 @@ export class BusinessDesk {
           amount: toMajor(line.amount),
           destination: line.destination,
           label: line.label,
-        }, `${batch.id}:${line.ref}`);
+        }, `${batch.id}:${line.ref}`, 'desk');
         lines.push({ ...line, paymentId: payment.id });
       } catch (error) {
         lines.push({ ...line, error: error instanceof AppError ? error.message : 'échec du paiement' });

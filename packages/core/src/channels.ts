@@ -1,3 +1,4 @@
+import type { ConfirmationProof } from './confirmation.ts';
 import type { SpaceKind } from './model.ts';
 
 /**
@@ -40,4 +41,6 @@ export interface Actor {
   personId: string;
   channel: Channel;
   spaceId?: string;
+  /** Le code de confirmation forte joint à cette demande, s'il y en a un (voir confirmation.ts). */
+  confirmation?: ConfirmationProof;
 }

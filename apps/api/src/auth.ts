@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
-import { AppError, normalizeNin, type AppGn, type SpaceEntry } from '@app-gn/core';
+import { AppError, maskPhone, normalizeNin, type AppGn, type ConfirmationChallenge, type ConfirmationProof, type Confirmer, type Operation, type Person, type SpaceEntry } from '@app-gn/core';
 
 /**
  * Connexion par NIN + code à usage unique envoyé par SMS, puis session signée.
@@ -42,6 +42,7 @@ const CODE_TTL_MS = 5 * 60_000;
 const MAX_ATTEMPTS = 5;
 const CODES_PER_WINDOW = 3;
 const CODE_WINDOW_MS = 15 * 60_000;
+const CONFIRMATIONS_PER_WINDOW = 5;
 export const SESSION_TTL_MS = 12 * 60 * 60_000;
 
 /** Ce qu'un défi permet une fois le code donné : se connecter, s'inscrire, choisir l'espace, confirmer une opération. */
@@ -121,7 +122,7 @@ export type SignInResult =
   | { kind: 'session'; token: string; session: Session }
   | { kind: 'choose_space'; selectionToken: string; spaces: SpaceEntry[] };
 
-export class Auth {
+export class Auth implements Confirmer {
   private readonly app: AppGn;
   private readonly sms: SmsSender;
   private readonly secret: string;
@@ -242,6 +243,33 @@ export class Auth {
     const ok = challenge.codeHash !== undefined && /^\d{6}$/.test(code) && safeEqual(this.hashCode(challengeId, code), challenge.codeHash);
     if (!ok) throw refused;
     return challenge;
+  }
+
+  // ── Confirmation forte (au-delà du seuil d'entreprise) ──
+
+  /** Code lié à l'opération exacte, envoyé au numéro de la personne ; au plus 5 en 15 minutes par personne. */
+  async challenge(person: Person, operation: Operation): Promise<ConfirmationChallenge> {
+    const now = this.now();
+    if (await this.store.recordCodeRequest(`confirm:${person.id}`, now, now - CODE_WINDOW_MS + 1) > CONFIRMATIONS_PER_WINDOW) {
+      throw new AppError('rate_limited', 'trop de codes de confirmation demandés : réessayez dans quelques minutes');
+    }
+    const challengeId = randomUUID();
+    const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
+    const expiresAt = now + CODE_TTL_MS;
+    await this.store.saveChallenge(challengeId, { purpose: 'confirmation', personId: person.id, codeHash: this.hashCode(challengeId, code), expiresAt, attempts: 0, payload: { operation: operation.key } });
+    await this.sms.send(person.phone, `App GN : code ${code} pour confirmer ${operation.summary}. Il expire dans 5 minutes. Si ce n’est pas vous, ne le donnez à personne.`);
+    return { challengeId, expiresAt: new Date(expiresAt).toISOString(), sentTo: maskPhone(person.phone), ...(this.revealCodes ? { demoCode: code } : {}) };
+  }
+
+  /** Une seule tentative par code : juste ou faux, le défi est consommé. */
+  async verify(person: Person, operation: Operation, proof: ConfirmationProof): Promise<boolean> {
+    if (typeof proof?.challengeId !== 'string' || typeof proof.code !== 'string' || proof.challengeId.length > 64) return false;
+    const challenge = await this.store.countAttempt(proof.challengeId);
+    if (!challenge || challenge.purpose !== 'confirmation') return false;
+    const consumed = await this.store.consumeChallenge(proof.challengeId);
+    return consumed && challenge.personId === person.id && challenge.expiresAt > this.now()
+      && (challenge.payload as { operation?: unknown } | undefined)?.operation === operation.key
+      && challenge.codeHash !== undefined && /^\d{6}$/.test(proof.code) && safeEqual(this.hashCode(proof.challengeId, proof.code), challenge.codeHash);
   }
 
   issue(personId: string, spaceId: string): { token: string; session: Session } {

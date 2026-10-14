@@ -261,3 +261,37 @@ describe('membres d’une organisation', () => {
     assert.equal((await context.server.inject({ method: 'DELETE', url: `${url}/per_sekou`, headers: sekou })).statusCode, 400);
   });
 });
+
+describe('confirmation forte par SMS', () => {
+  it('le code part au numéro du dirigeant, lié à l’opération, une tentative ; il n’est rendu qu’en démonstration', async () => {
+    const { app } = createDemoApp();
+    const sms = new MemorySmsSender();
+    const auth = new Auth({ app, sms, secret: SECRET });
+    app.useConfirmer(auth);
+    const server = buildServer(app, { auth, demoLogin: true });
+    const headers = { authorization: 'Bearer demo:per_sekou@spc_biz_boke', 'appgn-channel': 'desktop', 'idempotency-key': 'conf-1' };
+    const payload = { sourceAccountId: 'acc_bl_eco', amount: '12000000', destination: { type: 'own_account', accountId: 'acc_bl_uba' } };
+    const asked = await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/payments', headers, payload });
+    assert.equal(asked.statusCode, 428);
+    assert.equal(asked.json().confirmation.demoCode, undefined);
+    assert.equal(sms.sent.at(-1)?.phone, '+224 622 00 00 05');
+    assert.match(sms.sent.at(-1)?.text ?? '', /pour confirmer le paiement de 12\s000\s000 GNF/);
+    const code = sms.lastCodeFor('+224 622 00 00 05')!;
+    const wrong = code === '000000' ? '111111' : '000000';
+    const failed = await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/payments', headers: { ...headers, 'appgn-confirmation': `${asked.json().confirmation.challengeId}.${wrong}` }, payload });
+    assert.equal(failed.statusCode, 428);
+    // Le premier défi est consommé par l'essai faux : son code juste ne vaut plus.
+    const late = await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/payments', headers: { ...headers, 'appgn-confirmation': `${asked.json().confirmation.challengeId}.${code}` }, payload });
+    assert.equal(late.statusCode, 428);
+    const fresh = late.json().confirmation.challengeId;
+    const ok = await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/payments', headers: { ...headers, 'appgn-confirmation': `${fresh}.${sms.lastCodeFor('+224 622 00 00 05')}` }, payload });
+    assert.equal(ok.statusCode, 201);
+    assert.equal(ok.json().status, 'completed');
+    // Au plus 5 codes en 15 minutes : le suivant est refusé.
+    for (let index = 0; index < 2; index += 1) {
+      await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/payments', headers: { ...headers, 'idempotency-key': `conf-x${index}` }, payload });
+    }
+    const limited = await server.inject({ method: 'POST', url: '/v1/spaces/spc_biz_boke/payments', headers: { ...headers, 'idempotency-key': 'conf-y' }, payload });
+    assert.equal(limited.statusCode, 429);
+  });
+});

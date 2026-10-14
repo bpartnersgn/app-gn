@@ -22,7 +22,17 @@ async function resolveActor(request: FastifyRequest, auth: Auth | undefined, all
   const personId = demo?.[1] ?? session?.personId;
   const spaceId = demo ? demo[2] : session?.spaceId;
   if (!personId) throw new AppError('unauthenticated', 'session absente ou expirée : connectez-vous');
-  return { personId, channel: channelOf(request), ...(spaceId ? { spaceId } : {}) };
+  const confirmation = confirmationOf(request);
+  return { personId, channel: channelOf(request), ...(spaceId ? { spaceId } : {}), ...(confirmation ? { confirmation } : {}) };
+}
+
+/** `AppGN-Confirmation: <challengeId>.<code>` : le code de confirmation forte reçu par SMS, joint à la demande qu'il confirme. */
+function confirmationOf(request: FastifyRequest): Actor['confirmation'] {
+  const header = request.headers['appgn-confirmation'];
+  if (typeof header !== 'string') return undefined;
+  const match = /^([\w-]{8,64})\.(\d{6})$/.exec(header.trim());
+  if (!match) throw new AppError('invalid_request', 'AppGN-Confirmation : <défi>.<code à 6 chiffres>');
+  return { challengeId: match[1]!, code: match[2]! };
 }
 
 function channelOf(request: FastifyRequest): Channel {
@@ -63,7 +73,7 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
     if (error instanceof AppError) {
       // Journal de sécurité : qui est refusé et où, sans corps ni jeton.
       if (error.status === 401 || error.status === 403) request.log.warn({ code: error.code, method: request.method, route: request.routeOptions.url }, 'accès refusé');
-      return reply.status(error.status).send({ error: error.code, message: error.message });
+      return reply.status(error.status).send({ error: error.code, message: error.message, ...(error.details ?? {}) });
     }
     const status = typeof (error as { statusCode?: number }).statusCode === 'number' ? (error as { statusCode: number }).statusCode : 500;
     if (status < 500) return reply.status(status).send({ error: 'invalid_request', message: (error as Error).message });

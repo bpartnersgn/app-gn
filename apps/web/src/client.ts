@@ -10,6 +10,7 @@ import {
   type CardView,
   type ConsolidatedView,
   type DocumentVerification,
+  type ConfirmationProof,
   type DocumentView,
   type Exchange,
   type ExchangeInput,
@@ -42,6 +43,8 @@ export type SignInOutcome =
 
 export interface AppGnClient {
   readonly mode: 'api' | 'embedded';
+  /** Joint un code de confirmation forte à la prochaine demande, et à elle seule. */
+  confirmNext(proof: ConfirmationProof): void;
   /** Connexion : NIN → code par SMS → session dans un espace (nommé d'avance, ou choisi ensuite). */
   requestCode(nin: string): Promise<CodeChallenge>;
   openSession(challengeId: string, code: string, spaceId?: string): Promise<SignInOutcome>;
@@ -69,9 +72,12 @@ export interface AppGnClient {
 
 export class ClientError extends Error {
   readonly code: string;
-  constructor(code: string, message: string) {
+  /** Ce que le serveur joint à l'erreur (le défi d'une confirmation forte). */
+  readonly details?: Record<string, unknown>;
+  constructor(code: string, message: string, details?: Record<string, unknown>) {
     super(message);
     this.code = code;
+    if (details) this.details = details;
   }
 }
 
@@ -101,6 +107,8 @@ class HttpClient implements AppGnClient {
   readonly mode = 'api' as const;
   private readonly base: string;
   private readonly sessions = loadSessions();
+  private proof: ConfirmationProof | undefined;
+  confirmNext(proof: ConfirmationProof) { this.proof = proof; }
   constructor(base: string) {
     this.base = base.replace(/\/$/, '');
   }
@@ -140,12 +148,15 @@ class HttpClient implements AppGnClient {
   }
 
   private async call<T>(actor: Actor | null, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
+    const proof = actor ? this.proof : undefined;
+    if (proof) this.proof = undefined;
     let response: Response;
     try {
       response = await fetch(`${this.base}${path}`, {
         method,
         headers: {
           ...(actor ? { authorization: this.authorization(actor), 'appgn-channel': actor.channel } : {}),
+          ...(proof ? { 'appgn-confirmation': `${proof.challengeId}.${proof.code}` } : {}),
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
           ...headers,
         },
@@ -156,7 +167,10 @@ class HttpClient implements AppGnClient {
     }
     if (response.status === 204) return undefined as T;
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new ClientError(payload.error ?? 'http_error', payload.message ?? `HTTP ${response.status}`);
+    if (!response.ok) {
+      const { error, message, ...details } = payload as { error?: string; message?: string };
+      throw new ClientError(error ?? 'http_error', message ?? `HTTP ${response.status}`, Object.keys(details).length > 0 ? details : undefined);
+    }
     return payload as T;
   }
 
@@ -197,6 +211,8 @@ class EmbeddedClient implements AppGnClient {
   private readonly gapp = loadDemoGapp(this.app);
   private readonly challenges = new Map<string, { personId?: string; code: string; expiresAt: number }>();
   private readonly selections = new Map<string, string>();
+  private proof: ConfirmationProof | undefined;
+  confirmNext(proof: ConfirmationProof) { this.proof = proof; }
 
   // Démonstration sans serveur : même parcours que l'API, le code est montré au lieu d'être envoyé par SMS.
   async requestCode(nin: string): Promise<CodeChallenge> {
@@ -235,9 +251,16 @@ class EmbeddedClient implements AppGnClient {
       // Copie profonde : l'interface ne doit jamais tenir une référence vers l'état du noyau.
       return structuredClone(await work());
     } catch (error) {
-      if (error instanceof AppError) throw new ClientError(error.code, error.message);
+      if (error instanceof AppError) throw new ClientError(error.code, error.message, error.details && structuredClone(error.details));
       throw error;
     }
+  }
+
+  /** L'acteur de la demande, avec le code de confirmation joint s'il y en a un (comme l'en-tête côté API). Usage unique. */
+  private as(actor: Actor): Actor {
+    const proof = this.proof;
+    this.proof = undefined;
+    return proof ? { ...actor, confirmation: proof } : actor;
   }
 
   persons() { return this.run(() => this.app.listPersons()); }
@@ -246,8 +269,8 @@ class EmbeddedClient implements AppGnClient {
   services(actor: Actor, spaceId: string) { return this.run(() => this.app.services(actor, spaceId)); }
   transactions(actor: Actor, spaceId: string, accountId: string) { return this.run(() => this.app.transactions(actor, spaceId, accountId, 8)); }
   payments(actor: Actor, spaceId: string) { return this.run(() => this.app.listPayments(actor, spaceId)); }
-  pay(actor: Actor, spaceId: string, input: PaymentInput, key: string) { return this.run(() => this.app.initiatePayment(actor, spaceId, input, key)); }
-  approve(actor: Actor, spaceId: string, paymentId: string) { return this.run(() => this.app.approvePayment(actor, spaceId, paymentId)); }
+  pay(actor: Actor, spaceId: string, input: PaymentInput, key: string) { const acting = this.as(actor); return this.run(() => this.app.initiatePayment(acting, spaceId, input, key)); }
+  approve(actor: Actor, spaceId: string, paymentId: string) { const acting = this.as(actor); return this.run(() => this.app.approvePayment(acting, spaceId, paymentId)); }
   reject(actor: Actor, spaceId: string, paymentId: string) { return this.run(() => this.app.rejectPayment(actor, spaceId, paymentId)); }
   documents(actor: Actor, spaceId: string) { return this.run(() => this.app.documents(actor, spaceId)); }
   verifyDocument(code: string) { return this.run(() => this.app.verifyDocument(code)); }
@@ -258,11 +281,12 @@ class EmbeddedClient implements AppGnClient {
   executeExchange(actor: Actor, spaceId: string, quoteId: string, key: string) { return this.run(() => this.app.executeExchange(actor, spaceId, quoteId, key)); }
   // Même table de routes que l'API : le mode démo sert les tableaux de bord GAPP sans serveur.
   desk<T>(actor: Actor, spaceId: string, method: 'GET' | 'POST', path: string, body?: unknown, key?: string) {
+    const acting = this.as(actor);
     return this.run(async () => {
       const match = matchGappRoute(method, `/v1/spaces/${encodeURIComponent(spaceId)}/${path}`);
       if (!match) throw new AppError('not_found', 'route inconnue');
       const { spaceId: _space, ...params } = match.params;
-      return match.route.handle(await this.gapp, { actor, spaceId, params, body: (structuredClone(body) ?? {}) as Record<string, unknown>, key: key ?? '' }) as Promise<T>;
+      return match.route.handle(await this.gapp, { actor: acting, spaceId, params, body: (structuredClone(body) ?? {}) as Record<string, unknown>, key: key ?? '' }) as Promise<T>;
     });
   }
 }

@@ -16,10 +16,11 @@ import {
 import { spaceOpensOn, type Actor } from './channels.ts';
 import { SimulatedConnector, SimulatedNetwork, type AccountConnector } from './connectors.ts';
 import { documentView, seedDocuments, type DocumentVerification, type DocumentView, type VaultDocument } from './documents.ts';
+import { DemoConfirmer, maskPhone, needsStrongConfirmation, type Confirmer } from './confirmation.ts';
 import { MemoryDirectoryStore, normalizeGuineaMobile, normalizeNin, type Directory, type DirectoryStore } from './directory.ts';
 import { AppError } from './errors.ts';
 import type { AccountTransaction, AdministrationSpace, BusinessSpace, CitizenSpace, LinkedAccount, Membership, Person, Role, Space } from './model.ts';
-import { convert, isCurrency, money, parseMajor, toBigInt, type Currency, type FxTable } from './money.ts';
+import { convert, formatMoney, isCurrency, money, parseMajor, toBigInt, type Currency, type FxTable, type Money } from './money.ts';
 import {
   approvalRequirement,
   BILLERS,
@@ -101,6 +102,8 @@ export interface AppGnDependencies {
    * sont la copie de travail. Par défaut, un magasin en mémoire tiré de ces listes.
    */
   directory?: DirectoryStore;
+  /** Envoi et vérification des codes de confirmation forte. Par défaut : code montré (démonstration). */
+  confirmer?: Confirmer;
 }
 
 export interface RegistrationInput {
@@ -131,6 +134,7 @@ export class AppGn {
   private readonly quotes = new Map<string, ExchangeQuote>();
   private readonly now: () => Date;
   private readonly directory: DirectoryStore;
+  private confirmer: Confirmer;
   private lastRefresh = 0;
 
   constructor(deps: AppGnDependencies) {
@@ -138,6 +142,7 @@ export class AppGn {
     this.now = deps.now ?? (() => new Date());
     this.store = deps.store ?? new MemoryAppStore();
     this.directory = deps.directory ?? new MemoryDirectoryStore(deps);
+    this.confirmer = deps.confirmer ?? new DemoConfirmer();
     this.aggregator = new Aggregator({
       connectors: deps.connectors,
       fx: deps.fx,
@@ -183,6 +188,11 @@ export class AppGn {
     // Les comptes de carte émis sont gardés par le magasin des paiements (issued_cards) : on les conserve.
     replace(this.deps.accounts, [...fresh.accounts, ...cardAccounts.filter((account) => !fresh.accounts.some((candidate) => candidate.id === account.id))]);
     replace(this.deps.documents, fresh.documents);
+  }
+
+  /** Branche l'envoi réel des codes de confirmation (le serveur le fait une fois la connexion montée). */
+  useConfirmer(confirmer: Confirmer): void {
+    this.confirmer = confirmer;
   }
 
   /** Copie du référentiel de travail (pour le verser dans un magasin vide). */
@@ -415,6 +425,11 @@ export class AppGn {
       amount = typeof input.amount === 'string' ? parseMajor(input.amount, source.currency) : null;
       if (!amount || BigInt(amount.amount) <= 0n) throw new AppError('invalid_request', `montant invalide pour ${source.currency}`);
       this.validateDestination(spaceId, source, input.destination);
+      // Le dirigeant qui paie lui-même au-delà du seuil confirme par code. Un paiement né d'un lot ou d'une
+      // déclaration (`desk`) a été confirmé à ce niveau-là.
+      if (origin !== 'desk' && approvalRequirement(space.kind, role, amount) === 'none') {
+        await this.confirmStrongly(actor, space, amount, `payment.initiate|${idempotencyKey}|${fingerprintOf(input)}`, `le paiement de ${formatMoney(amount)} (${input.label?.trim() || defaultLabel(input.destination)})`);
+      }
     } catch (error) {
       // Une demande refusée ne garde pas sa clé : corrigée, elle peut repartir sous la même.
       await this.store.releaseIdempotency(claim);
@@ -447,6 +462,7 @@ export class AppGn {
     if (payment.initiatedBy === actor.personId) {
       throw new AppError('separation_of_duties', 'l’initiateur d’un paiement ne peut pas l’approuver');
     }
+    if (origin !== 'desk') await this.confirmStrongly(actor, space, payment.amount, `payment.approve|${payment.id}`, `l’approbation du paiement de ${formatMoney(payment.amount)} (${payment.label})`);
     payment.decidedBy = actor.personId;
     return this.submit(payment);
   }
@@ -647,6 +663,21 @@ export class AppGn {
     return payment?.spaceId === spaceId ? payment : undefined;
   }
 
+  /**
+   * Confirmation forte d'une opération d'entreprise au-delà du seuil : passe si la demande porte un code juste pour
+   * cette opération ; sinon un code part au numéro de la personne et l'opération est refusée en `confirmation_required`
+   * (428), avec de quoi renvoyer la même demande et le code. Sans effet sous le seuil et hors entreprise.
+   */
+  async confirmStrongly(actor: Actor, space: Space, amount: Money, operation: string, summary: string): Promise<void> {
+    if (space.kind !== 'business' || !needsStrongConfirmation(amount)) return;
+    const person = this.person(actor.personId);
+    const wanted = { key: `${space.id}|${operation}`, summary };
+    if (actor.confirmation && await this.confirmer.verify(person, wanted, actor.confirmation)) return;
+    const challenge = await this.confirmer.challenge(person, wanted);
+    const retry = actor.confirmation ? 'code incorrect ou expiré : un nouveau code a été envoyé' : 'confirmez avec le code envoyé par SMS';
+    throw new AppError('confirmation_required', `${retry} au ${maskPhone(person.phone)}`, { confirmation: { ...challenge, summary } });
+  }
+
   /** Les documents d'un espace, sans contrôle d'accès : pour un bureau qui en lit la validité après `guard`. */
   documentsOf(spaceId: string): DocumentView[] {
     const now = this.now();
@@ -823,6 +854,13 @@ export class AppGn {
     if (!account) throw new AppError('not_found', 'compte introuvable dans cet espace');
     return account;
   }
+}
+
+/** Contenu d'une demande, sous une forme stable (clés triées) : deux demandes identiques ont la même. */
+export function fingerprintOf(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+    : item);
 }
 
 function replace<T>(target: T[], items: readonly T[]): void {

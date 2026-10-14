@@ -3,6 +3,7 @@ import { CHANNEL_LABELS, CHANNELS, spaceOpensOn, type Actor, type Channel, type 
 import { createBaseClient, type CodeChallenge, type OpenedSession, type SignInOutcome } from './client.ts';
 import { SessionContext, useOfflineStatus, useViewportChannel } from './context.ts';
 import { SPACE_KIND_SHORT, dateTime } from './format.ts';
+import { ConfirmDialog } from './ConfirmDialog.tsx';
 import { OfflineClient } from './offline.ts';
 import { sectionsFor, SpaceView, type Section } from './SpaceView.tsx';
 
@@ -182,6 +183,7 @@ export function App() {
             </nav>
           )}
 
+          <ConfirmDialog client={client} />
           <footer className="foot">
             Démo du socle. Données fictives, connecteurs simulés : aucun fournisseur réel n’est appelé et aucun argent ne bouge.
           </footer>

@@ -19,12 +19,14 @@ export function useDeskAction(spaceId: string, onDone: () => void) {
   async function run<T>(method: 'GET' | 'POST', path: string, body: unknown, success: (result: T) => Message | null, withKey = false): Promise<T | undefined> {
     setBusy(true);
     try {
-      const result = await client.write(() => client.base.desk<T>(actor, spaceId, method, path, body, withKey ? crypto.randomUUID() : undefined));
+      // Une clé par action, gardée si la demande est renvoyée (avec le code de confirmation, par exemple).
+      const key = withKey ? crypto.randomUUID() : undefined;
+      const result = await client.write(() => client.base.desk<T>(actor, spaceId, method, path, body, key));
       setMessage(success(result));
       onDone();
       return result;
     } catch (cause) {
-      setMessage({ tone: 'bad', text: (cause as Error).message });
+      setMessage({ tone: (cause as { code?: string }).code === 'cancelled' ? 'wait' : 'bad', text: (cause as Error).message });
       return undefined;
     } finally {
       setBusy(false);

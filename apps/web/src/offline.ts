@@ -37,6 +37,12 @@ export interface OfflineStatus {
   syncing: boolean;
 }
 
+/** Ce que la boîte de dialogue montre pour une confirmation forte. */
+export interface CodeRequest {
+  message: string;
+  challenge: { challengeId: string; expiresAt: string; sentTo: string; summary: string; demoCode?: string };
+}
+
 export type PayResult = { kind: 'sent'; payment: Payment } | { kind: 'queued'; operation: PendingOperation<PaymentInput> };
 
 /**
@@ -133,11 +139,17 @@ export class OfflineClient {
     return snapshot.data;
   }
 
+  /**
+   * Qui demande le code de confirmation forte à la personne (la boîte de dialogue de l'application). Rend le code
+   * saisi, ou `null` si elle renonce.
+   */
+  askCode: ((request: CodeRequest) => Promise<string | null>) | null = null;
+
   /** Écriture qui exige le réseau. */
   async write<T>(work: () => Promise<T>): Promise<T> {
     if (!this.mayTry) throw new ClientError('offline', 'Cette action demande une connexion. Réessayez au retour du réseau.');
     try {
-      const result = await work();
+      const result = await this.confirming(work);
       this.reachable();
       return result;
     } catch (error) {
@@ -146,11 +158,29 @@ export class OfflineClient {
     }
   }
 
+  /**
+   * Au-delà du seuil d'entreprise, le serveur demande un code reçu par SMS (428) : on le demande à la personne et on
+   * renvoie la même demande avec le code. Un code faux en fait partir un autre ; la personne peut renoncer.
+   */
+  private async confirming<T>(work: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await work();
+      } catch (error) {
+        const challenge = error instanceof ClientError && error.code === 'confirmation_required' ? error.details?.confirmation as CodeRequest['challenge'] | undefined : undefined;
+        if (!challenge || !this.askCode || attempt >= 3) throw error;
+        const code = await this.askCode({ message: (error as ClientError).message, challenge });
+        if (!code) throw new ClientError('cancelled', 'Opération non confirmée : rien n’est parti.');
+        this.base.confirmNext({ challengeId: challenge.challengeId, code });
+      }
+    }
+  }
+
   async pay(actor: Actor, spaceId: string, input: PaymentInput): Promise<PayResult> {
     const key = crypto.randomUUID();
     if (this.mayTry) {
       try {
-        const payment = await this.base.pay(actor, spaceId, input, key);
+        const payment = await this.confirming(() => this.base.pay(actor, spaceId, input, key));
         this.reachable();
         return { kind: 'sent', payment };
       } catch (error) {

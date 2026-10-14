@@ -51,6 +51,9 @@ const refresher = database && refreshEvery > 0
 const demoLogin = process.env.APPGN_DEMO_LOGIN !== 'off';
 const sessionSecret = sessionSecretFromEnvironment(process.env);
 const auth = new Auth({ app, sms: new MemorySmsSender(), secret: sessionSecret.secret, revealCodes: demoLogin, store: database?.store });
+// Les codes de confirmation forte (au-delà de 5 M GNF) partent par le même canal que ceux de connexion. Les données de
+// démonstration ont été versées avant, avec des codes rendus à l'écran.
+app.useConfirmer(auth);
 
 const orcheaReceiver = orchea ? new OrcheaWebhookReceiver(app, orchea.webhookSecrets, { processed: database?.store }) : undefined;
 // Rattrapage : un webhook perdu ne laisse pas un paiement « en cours ». Au démarrage, puis à intervalle régulier.

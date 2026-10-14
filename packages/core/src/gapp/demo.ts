@@ -1,5 +1,6 @@
 import type { AppGn } from '../app.ts';
 import type { Actor } from '../channels.ts';
+import { withDemoConfirmation } from '../confirmation.ts';
 import { DEMO_CIVIL_REGISTRY } from '../seed.ts';
 import { AdministrationDesk } from './administration.ts';
 import { BusinessDesk } from './business.ts';
@@ -62,7 +63,7 @@ async function seedBusiness(app: AppGn, business: BusinessDesk): Promise<void> {
   await bill('demo-bill-4', { supplier: { name: 'Sécurité Escorte Boké' }, payee: { operator: 'cellcom_money', phone: '+224 655 10 41 04' }, reference: 'SEB-104', amount: '2400000', issueDate: at(-6), dueDate: at(6) });
 
   // Le dirigeant a déjà réglé le garage ; le directeur financier a préparé un lot qui attend son approbation.
-  await business.createSupplierBatch(sekou, boke, { billIds: [garage.id], sourceAccountId: 'acc_bl_om' }, 'demo-lot-1');
+  await withDemoConfirmation(sekou, (actor) => business.createSupplierBatch(actor, boke, { billIds: [garage.id], sourceAccountId: 'acc_bl_om' }, 'demo-lot-1'));
   await business.createSupplierBatch(alpha, boke, { billIds: [fuel.id, tyres.id], sourceAccountId: 'acc_bl_eco' }, 'demo-lot-2');
 
   // Équipe, attestation remise dans le coffre de Kadiatou, paie du mois dernier versée.
@@ -79,12 +80,13 @@ async function seedBusiness(app: AppGn, business: BusinessDesk): Promise<void> {
   await business.issueCertificate(aissatou, boke, employees[1]!.id);
   const lastMonth = periodOf(addDays(`${periodOf(today)}-01`, -1));
   const payroll = await business.preparePayroll(aissatou, boke, { period: lastMonth, sourceAccountId: 'acc_bl_eco' }, 'demo-paie-1');
-  await business.approveBatch(sekou, boke, payroll.id);
+  // Au-delà du seuil, le dirigeant confirme par code ; en démonstration, le code est rendu.
+  await withDemoConfirmation(sekou, (actor) => business.approveBatch(actor, boke, payroll.id));
 
   // TVA d'il y a deux mois : déclarée par le directeur financier, paiement approuvé par le dirigeant.
   const twoMonthsAgo = periodOf(addDays(`${lastMonth}-01`, -1));
   const vat = await business.fileVat(alpha, boke, { period: twoMonthsAgo, sourceAccountId: 'acc_bl_eco' }, 'demo-tva-1');
-  if (vat.paymentId && vat.state === 'awaiting_approval') await app.approvePayment(sekou, boke, vat.paymentId);
+  if (vat.paymentId && vat.state === 'awaiting_approval') await withDemoConfirmation(sekou, (actor) => app.approvePayment(actor, boke, vat.paymentId!));
 
   // Couture Mariama : micro-entreprise en franchise de TVA, une facture fournisseur qui tend la trésorerie.
   const mariama = desk('per_mariama', 'spc_biz_couture');
