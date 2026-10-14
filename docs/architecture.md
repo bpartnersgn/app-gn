@@ -71,7 +71,7 @@ Matrice complète : `packages/core/src/rbac.ts`. Un espace dont on n'est pas mem
 
 **Règles d'approbation** (`payments.ts`) :
 - citoyen : aucune ;
-- entreprise : au-delà de 5 000 000 GNF, une seconde personne habilitée approuve, sauf si l'initiateur est lui-même habilité (le dirigeant ; une confirmation forte par OTP viendra avec l'authentification réelle) ;
+- entreprise : au-delà de 5 000 000 GNF, une seconde personne habilitée approuve, sauf si l'initiateur est lui-même habilité (le dirigeant), qui confirme alors par code SMS (ci-dessous) ;
 - administration : toujours une seconde personne. L'ordonnateur mandate, le comptable public vise et paie. Celui qui initie ne peut jamais approuver.
 
 **Séparation des fonds** (exigence du 13/10/2026). Chaque session est liée à un seul espace : l'espace personnel, ou une entreprise, ou une administration.
@@ -84,8 +84,12 @@ Matrice complète : `packages/core/src/rbac.ts`. Un espace dont on n'est pas mem
 - `POST /v1/auth/codes {nin}` → `202 {challengeId, expiresAt}`, identique que le NIN soit connu ou non (ni l'existence de la personne ni son numéro ne se devinent) ; au plus 3 codes par NIN en 15 minutes (`429`).
 - `POST /v1/auth/sessions {challengeId, code, spaceId?}` → `201 {token, expiresAt, me}` dans l'espace nommé, ou directement dans l'espace personnel pour qui n'a que lui ; sinon `200 {chooseSpace, selectionToken, spaces}`, puis `POST /v1/auth/sessions/space {selectionToken, spaceId}` (5 minutes, usage unique). Le code vit 5 minutes, se tente 5 fois, ne sert qu'une fois ; seule son empreinte est gardée.
 - Jeton `ags1.<charge>.<HMAC-SHA256>` (clé `APPGN_SESSION_SECRET`) qui porte la personne et l'espace, valable 12 h, révocable par `DELETE /v1/auth/sessions/current`. L'application le garde sur l'appareil pour rester utilisable hors ligne.
-- Aucun fournisseur SMS n'est branché : en démonstration (`APPGN_DEMO_LOGIN`, ouverte par défaut), la réponse porte le code et l'accès rapide `Bearer demo:<personId>@<spaceId>` (lié à l'espace comme une vraie session ; `demo:<personId>` sans espace sert aux essais de l'API) reste ouvert ; `APPGN_DEMO_LOGIN=off` ferme les deux.
-- Reste à faire : fournisseur SMS (agrégateur local ou opérateur), défis et révocations en base, appareil enregistré (qui fixera le format d'appareil au lieu de l'en-tête déclaré), confirmation forte par code des paiements au-delà du seuil, raccordement à l'identité numérique nationale quand elle offrira une API.
+- **Inscription** : `POST /v1/registrations {nin, name, phone}` → `202 {challengeId, expiresAt}` ; le code part au mobile saisi (`+224 6XX…`). `POST /v1/registrations/confirm {challengeId, code}` crée la personne (identité déclarée) et son espace personnel, puis ouvre la session. Un NIN déjà inscrit reçoit la même réponse, sans code, et le titulaire est prévenu par SMS.
+- **Membres** : le dirigeant ou l'ordonnateur (`members:manage`) lit, ajoute (par NIN d'une personne inscrite) et retire les membres : `GET|POST /v1/spaces/:id/members`, `DELETE /v1/spaces/:id/members/:personId`. Les organisations s'ouvrent par l'outil de l'exploitant (`npm run admin -w @app-gn/api`).
+- **Confirmation forte** (`packages/core/src/confirmation.ts`) : en entreprise, un paiement, un visa, un lot exécuté ou une TVA déclarée à partir de 5 M GNF (ou en devises) répond `428 confirmation_required` avec `{challengeId, expiresAt, sentTo}` ; le code part par SMS, lié à l'opération exacte, et la demande est renvoyée avec l'en-tête `AppGN-Confirmation: <challengeId>.<code>`. Un essai par code, 5 codes par 15 minutes. L'application web affiche la saisie du code et renvoie la même demande (même clé d'idempotence).
+- **SMS** : `APPGN_SMS_PROVIDER=orange` (avec `ORANGE_SMS_CLIENT_ID`, `ORANGE_SMS_CLIENT_SECRET`, `ORANGE_SMS_SENDER`, `ORANGE_SMS_SENDER_NAME` en option) envoie par l'API SMS d'Orange ; sans fournisseur, les codes restent en mémoire. Une panne du fournisseur rend `503 unavailable`.
+- En démonstration (`APPGN_DEMO_LOGIN`, ouverte par défaut), la réponse porte le code et l'accès rapide `Bearer demo:<personId>@<spaceId>` (lié à l'espace comme une vraie session ; `demo:<personId>` sans espace sert aux essais de l'API) reste ouvert ; `APPGN_DEMO_LOGIN=off` ferme les deux.
+- Reste à faire : essai du SMS Orange sur un compte réel, appareil enregistré (qui fixera le format d'appareil au lieu de l'en-tête déclaré), raccordement à l'identité numérique nationale quand elle offrira une API.
 
 ## 5. Agrégation des comptes
 
@@ -188,8 +192,8 @@ Un espace administration ne paie jamais en direct : le noyau refuse tout paiemen
 
 ## 11. Ce qui reste simulé ou absent
 
-- Identité : NIN + code SMS et sessions signées (§4), mais SMS non envoyé (code montré en démo) et état en mémoire. Cible : fournisseur SMS, base, identité numérique nationale.
-- Persistance : PostgreSQL pour l'état transactionnel (§12) ; référentiel encore issu des données de démonstration.
+- Identité : NIN + code SMS, inscription et sessions signées (§4), défis en base. SMS Orange branché mais jamais essayé sans contrat ; identité déclarée, sans vérification nationale.
+- Persistance : PostgreSQL pour l'état transactionnel et le référentiel (§12).
 - Cartes et conversions : émetteur et cours simulés, frais fictifs.
 - Documents : fictifs, aucun émetteur raccordé, pas encore de signature.
 - Connecteurs : tous simulés. Chaque fournisseur réel demande un accord et une API (voir `positionnement/chiffres-a-sourcer.md` pour Ecobank, UBA, Cellcom, Moov).
@@ -209,14 +213,26 @@ Le port `AppStore` (`packages/core/src/store.ts`) garde ce qui doit survivre à 
 
 Les bureaux GAPP gardent leurs enregistrements (factures, lots, engagements, mandats, agents, journaux) dans `desk_records` : JSONB versionné, écrit par `UPDATE … WHERE version = …`, ce qui donne des numéros sans trou et des crédits engagés jamais dépassés, même à plusieurs instances.
 
-Le schéma (`db/schema.sql`) s'applique au démarrage et se rejoue sans effet. Les objets sont gardés en JSONB, dans la forme exacte du noyau, avec en colonnes ce qui sert à chercher et à verrouiller. Chaque garantie tient dans une seule instruction SQL, donc plusieurs instances peuvent partager la base :
+Le schéma vient des migrations numérotées `db/migrations/NNN-*.sql` (socle, bureaux GAPP, limites de débit, référentiel, flux ORCHEA), appliquées au démarrage dans l'ordre, chacune dans sa transaction, sous un verrou consultatif : deux instances qui démarrent ensemble n'appliquent rien deux fois. Les objets sont gardés en JSONB, dans la forme exacte du noyau, avec en colonnes ce qui sert à chercher et à verrouiller. Chaque garantie tient dans une seule instruction SQL, donc plusieurs instances peuvent partager la base :
 - une clé d'idempotence se réserve par `INSERT … ON CONFLICT DO NOTHING` avant tout effet, et se libère si la demande est refusée ;
 - un paiement ne change d'état que s'il est encore dans l'état attendu (`UPDATE … WHERE status = …`) : deux visas simultanés d'un même mandat n'en paient qu'un ;
 - un code de connexion se consomme par `DELETE … RETURNING` : un seul essai simultané l'emporte.
 
 Vérifié le 12/10/2026 sur PGlite et sur PostgreSQL 16 (mêmes tests, `TEST_DATABASE_URL`), et par redémarrage du serveur : session, paiement, rejeu par la même clé, carte émise et révocation retrouvés.
 
-Ce qui reste en mémoire : le référentiel (personnes, espaces, rattachements, comptes liés, documents), qui vient encore des données de démonstration et viendra de l'inscription ; les devis de conversion (60 s) ; les cartes chargées au démarrage, ce qui suppose une seule instance tant que l'émission n'est pas relue en base à chaque demande.
+Le référentiel (personnes, espaces, rattachements, comptes liés, documents) est en base (`DirectoryStore`) : le noyau en garde une copie relue au démarrage, toutes les 30 s (`APPGN_DIRECTORY_REFRESH_MS`) et aussitôt pour un NIN ou un espace inconnu. Les limites de débit (`rate_limits`) et le curseur du flux ORCHEA (`feed_cursors`, sous bail) y sont aussi.
+
+**Exploitation** :
+
+| Réglage | Effet |
+|---|---|
+| `APPGN_ENV=production` | refuse de démarrer sans `APPGN_DEMO_LOGIN=off`, `APPGN_SESSION_SECRET`, `DATABASE_URL`, `APPGN_ALLOWED_ORIGINS`, `APPGN_SMS_PROVIDER` ; aucune donnée de démonstration |
+| `APPGN_ALLOWED_ORIGINS` | origines web admises (CORS) ; une autre reçoit 403 |
+| `APPGN_TRUST_PROXY` | mandataires de confiance (IP ou CIDR, ou `true`) |
+| `APPGN_RATE_PER_IP`, `APPGN_RATE_PER_SESSION`, `APPGN_RATE_WRITES` | demandes par minute (600, 300, 60) |
+| `ORCHEA_FEED_INTERVAL_MS` | rattrapage des événements ORCHEA (60 000) |
+
+Ce qui reste en mémoire : les devis de conversion (60 s) ; les cartes chargées au démarrage, ce qui suppose une seule instance tant que l'émission n'est pas relue en base à chaque demande.
 
 ## 13. Stack
 

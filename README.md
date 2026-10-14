@@ -4,7 +4,7 @@ Une seule application pour le **citoyen** (application mobile ou web), l'**entre
 
 Les paiements passent par l'orchestrateur [ORCHEA](https://github.com/orcheagn/-orchea-payment) (XeyLink Router), dans son propre dépôt.
 
-**État : socle v0.4.0.** Données fictives et connecteurs simulés : aucun fournisseur réel n'est appelé, aucun argent ne bouge.
+**État : socle v0.5.0.** Données fictives et connecteurs simulés : aucun argent ne bouge. Le serveur se prépare à la production (sécurité HTTP, référentiel en base, inscription, rattrapage ORCHEA, confirmation par SMS), voir [ADR-008](docs/adr/adr-008-vers-la-production.md).
 
 ## Ce que fait le socle
 - Trois espaces dans la même application, un rôle par espace, une session par espace : fonds personnels et fonds d'une organisation ne s'affichent jamais ensemble.
@@ -18,7 +18,7 @@ Les paiements passent par l'orchestrateur [ORCHEA](https://github.com/orcheagn/-
 - GAPP Institutionnel : budget et exécution, chaîne engagement → liquidation → mandat → visa (ordonnateur et comptable public distincts), paie des agents contrôlée contre l'état civil, recettes, rapport Cour des comptes. Aucun paiement direct hors mandat.
 - Cartes virtuelles et conversions sur le modèle de Keecash : plusieurs cartes, blocage instantané, recharge depuis Mobile Money ou crypto avec devis (frais et cours) avant confirmation.
 
-Architecture : [docs/architecture.md](docs/architecture.md). Décisions : [docs/adr/](docs/adr/), dont [ADR-006](docs/adr/adr-006-un-espace-par-session.md) (un espace par session) et [ADR-007](docs/adr/adr-007-bureaux-gapp.md) (bureaux GAPP).
+Architecture : [docs/architecture.md](docs/architecture.md). Décisions : [docs/adr/](docs/adr/), dont [ADR-006](docs/adr/adr-006-un-espace-par-session.md) (un espace par session) [ADR-007](docs/adr/adr-007-bureaux-gapp.md) (bureaux GAPP) et [ADR-008](docs/adr/adr-008-vers-la-production.md) (vers la production).
 
 ## Démarrer
 Node ≥ 22.18.
@@ -63,11 +63,12 @@ Contre un ORCHEA partagé, ajouter `ORCHEA_MODE=test` avec une clé de test : ri
 Utilisateurs de démo : Kadiatou Sow (citoyenne, sans entreprise), Mariama Camara (citoyenne, dirigeante de Couture Mariama), Alpha Diallo (directeur financier de Boké Logistique), Sékou Condé (dirigeant de Boké Logistique), Fatoumata Bah (ordonnatrice, Commune de Kaloum), Ibrahima Sylla (comptable public, Commune de Kaloum).
 
 ## API (v1)
-Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeId, code, spaceId?}` (et, pour qui a plusieurs espaces sans en nommer un, `POST /v1/auth/sessions/space {selectionToken, spaceId}`) → `Authorization: Bearer <jeton>`. Une session vaut pour un seul espace : fonds personnels et fonds d'une organisation ne se lisent jamais ensemble. En démonstration, la réponse porte le code (aucun SMS n'est envoyé) et `Bearer demo:<personId>@<spaceId>` reste accepté ; `APPGN_DEMO_LOGIN=off` ferme les deux. `APPGN_SESSION_SECRET` (32 caractères au moins) garde les sessions d'un redémarrage à l'autre. Format d'appareil : `AppGN-Channel: phone | tablet | desktop` (`phone` par défaut).
+Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeId, code, spaceId?}` (et, pour qui a plusieurs espaces sans en nommer un, `POST /v1/auth/sessions/space {selectionToken, spaceId}`) → `Authorization: Bearer <jeton>`. Une session vaut pour un seul espace : fonds personnels et fonds d'une organisation ne se lisent jamais ensemble. En démonstration, la réponse porte le code (aucun SMS n'est envoyé) et `Bearer demo:<personId>@<spaceId>` reste accepté ; `APPGN_DEMO_LOGIN=off` ferme les deux. `APPGN_SESSION_SECRET` (32 caractères au moins) garde les sessions d'un redémarrage à l'autre. Format d'appareil : `AppGN-Channel: phone | tablet | desktop` (`phone` par défaut). Inscription : `POST /v1/registrations {nin, name, phone}` puis `POST /v1/registrations/confirm {challengeId, code}`. En entreprise, à partir de 5 M GNF, une réponse `428 confirmation_required` porte un défi ; renvoyer la même demande avec `AppGN-Confirmation: <challengeId>.<code>` (code reçu par SMS). En production : `APPGN_ENV=production` et les réglages de `docs/architecture.md` §12.
 
 | Méthode | Chemin | |
 |---|---|---|
 | GET | `/v1/me` | la personne et ses espaces (rôle, permissions) |
+| GET/POST | `/v1/spaces/:spaceId/members` | membres de l'organisation (dirigeant, ordonnateur) ; `DELETE …/members/:personId` pour retirer |
 | GET | `/v1/spaces/:spaceId/overview` | vue consolidée |
 | GET | `/v1/spaces/:spaceId/accounts/:accountId/transactions` | mouvements d'un compte |
 | GET | `/v1/spaces/:spaceId/services` | services accessibles au rôle |
@@ -84,6 +85,6 @@ Connexion : `POST /v1/auth/codes {nin}` puis `POST /v1/auth/sessions {challengeI
 
 ## Structure
 - `packages/core` — règles : profils et droits, agrégation, paiements, catalogue, montants ; `gapp/` pour les bureaux Entreprise et Administration et leur table de routes
-- `apps/api` — API HTTP (Fastify), connexion (`auth.ts`), adaptateur ORCHEA (`orchea.ts`), base (`db/`)
+- `apps/api` — API HTTP (Fastify), sécurité (`security.ts`), connexion et inscription (`auth.ts`), SMS (`sms.ts`), adaptateur ORCHEA et rattrapage (`orchea.ts`), base et migrations (`db/`), outil de l'exploitant (`admin.ts`)
 - `apps/web` — interface (React + Vite)
 - `docs/` — architecture et décisions
