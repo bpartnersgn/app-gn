@@ -3,7 +3,7 @@ import { buildServer } from './app.ts';
 import { Auth, MemorySmsSender, sessionSecretFromEnvironment } from './auth.ts';
 import { databaseFromEnvironment } from './db/connect.ts';
 import { MemoryRateLimitStore, productionProblems, securityFromEnvironment, trustProxyFromEnvironment } from './security.ts';
-import { OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromEnvironment } from './orchea.ts';
+import { OrcheaEventFeed, OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromEnvironment } from './orchea.ts';
 
 // En production, refuser de démarrer plutôt que de tourner ouvert (démo, secret, base, origines, SMS).
 const problems = productionProblems(process.env);
@@ -52,6 +52,11 @@ const demoLogin = process.env.APPGN_DEMO_LOGIN !== 'off';
 const sessionSecret = sessionSecretFromEnvironment(process.env);
 const auth = new Auth({ app, sms: new MemorySmsSender(), secret: sessionSecret.secret, revealCodes: demoLogin, store: database?.store });
 
+const orcheaReceiver = orchea ? new OrcheaWebhookReceiver(app, orchea.webhookSecrets, { processed: database?.store }) : undefined;
+// Rattrapage : un webhook perdu ne laisse pas un paiement « en cours ». Au démarrage, puis à intervalle régulier.
+const feed = orchea && orcheaReceiver ? new OrcheaEventFeed(orchea.config, orcheaReceiver, { cursors: database?.store }) : undefined;
+const feedEvery = Number(process.env.ORCHEA_FEED_INTERVAL_MS ?? 60_000);
+
 const server = buildServer(app, {
   logger: true,
   auth,
@@ -59,10 +64,22 @@ const server = buildServer(app, {
   gapp,
   security: securityFromEnvironment(process.env, database?.store ?? new MemoryRateLimitStore()),
   trustProxy: trustProxyFromEnvironment(process.env.APPGN_TRUST_PROXY),
-  ...(orchea ? { orcheaWebhooks: new OrcheaWebhookReceiver(app, orchea.webhookSecrets, { processed: database?.store }) } : {}),
+  ...(orcheaReceiver ? { orcheaWebhooks: orcheaReceiver } : {}),
 });
 if (refresher) server.addHook('onClose', async () => clearInterval(refresher));
 if (database) server.addHook('onClose', database.close);
+if (feed) {
+  const catchUp = async () => {
+    const report = await feed.catchUp();
+    if (report.status === 'error') server.log.warn(report, 'rattrapage ORCHEA en échec');
+    else if (report.applied > 0) server.log.info(report, 'rattrapage ORCHEA');
+  };
+  void catchUp();
+  if (feedEvery > 0) {
+    const timer = setInterval(() => void catchUp(), feedEvery).unref();
+    server.addHook('onClose', async () => clearInterval(timer));
+  }
+}
 await server.listen({ port, host });
 server.log.info({ database: database?.kind ?? 'mémoire' }, 'stockage');
 if (orchea) server.log.info({ baseUrl: orchea.config.baseUrl, mode: orchea.config.mode ?? 'live' }, 'paiements de factures via ORCHEA');

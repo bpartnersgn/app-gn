@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
   toMajor,
   type AppGn,
@@ -155,7 +155,7 @@ export type WebhookHandling =
   | { status: 400; result: 'malformed' }
   | { status: 200; result: 'duplicate' | 'ignored' | 'applied' | 'unknown_payment'; paymentId?: string };
 
-interface Envelope {
+export interface Envelope {
   eventId: string;
   type: string;
   payload: { paymentIntentId?: string; externalReference?: string; reason?: string; status?: string };
@@ -200,8 +200,15 @@ export class OrcheaWebhookReceiver {
     if (!verifyOrcheaSignature(this.secrets, signature, rawBody, this.now())) return { status: 401, result: 'invalid_signature' };
     const event = parseEnvelope(rawBody);
     if (!event) return { status: 400, result: 'malformed' };
-    if (await this.seen.has(event.eventId)) return { status: 200, result: 'duplicate' };
+    return this.apply(event);
+  }
 
+  /**
+   * Applique un événement déjà authentifié : reçu par webhook signé, ou lu dans le flux `GET /v1/events` avec
+   * notre clé d'API. Le même `eventId` venu par les deux voies n'est appliqué qu'une fois.
+   */
+  async apply(event: Envelope): Promise<Extract<WebhookHandling, { status: 200 }>> {
+    if (await this.seen.has(event.eventId)) return { status: 200, result: 'duplicate' };
     const outcome = outcomeOf(event);
     const intentId = event.payload.paymentIntentId;
     if (!outcome || !intentId) {
@@ -213,6 +220,116 @@ export class OrcheaWebhookReceiver {
     return payment
       ? { status: 200, result: 'applied', paymentId: payment.id }
       : { status: 200, result: 'unknown_payment' };
+  }
+}
+
+// ── Flux d'événements : rattrapage ──────────────────────────────────────────
+
+/**
+ * Où en est la lecture du flux, partagé entre instances. Une seule instance le lit à la fois : elle prend un bail,
+ * et n'avance le curseur que tant qu'elle le tient (un curseur ne recule jamais sous l'effet d'une instance lente).
+ */
+export interface FeedCursors {
+  /** Prend le bail jusqu'à `until` s'il est libre (ou déjà à `holder`) ; rend le curseur gardé, `null` s'il n'y en a pas, `undefined` si le bail est pris. */
+  lease(source: string, holder: string, until: number, now: number): Promise<string | null | undefined>;
+  /** Avance le curseur, seulement si `holder` tient encore le bail. */
+  advance(source: string, holder: string, cursor: string): Promise<boolean>;
+  release(source: string, holder: string): Promise<void>;
+}
+
+export class MemoryFeedCursors implements FeedCursors {
+  private readonly rows = new Map<string, { cursor: string | null; holder?: string; until: number }>();
+  async lease(source: string, holder: string, until: number, now: number) {
+    const row = this.rows.get(source) ?? { cursor: null, until: 0 };
+    if (row.holder && row.holder !== holder && row.until > now) return undefined;
+    this.rows.set(source, { cursor: row.cursor, holder, until });
+    return row.cursor;
+  }
+  async advance(source: string, holder: string, cursor: string) {
+    const row = this.rows.get(source);
+    if (!row || row.holder !== holder) return false;
+    row.cursor = cursor;
+    return true;
+  }
+  async release(source: string, holder: string) {
+    const row = this.rows.get(source);
+    if (row?.holder === holder) this.rows.set(source, { cursor: row.cursor, until: 0 });
+  }
+}
+
+export interface CatchUpReport {
+  /** `busy` : une autre instance lit le flux. */
+  status: 'done' | 'busy' | 'error';
+  pages: number;
+  events: number;
+  applied: number;
+  error?: string;
+}
+
+const FEED_SOURCE = 'orchea';
+const FEED_PAGE = 100;
+/** Au plus autant de pages par passage : le suivant reprendra où celui-ci s'est arrêté. */
+const FEED_MAX_PAGES = 50;
+const FEED_LEASE_MS = 2 * 60_000;
+
+/**
+ * Rattrape par `GET /v1/events` ce qu'un webhook n'a pas livré (service arrêté, livraison abandonnée).
+ * Chaque page est appliquée puis le curseur gardé, jamais avant : un arrêt entre les deux relit la page,
+ * sans effet grâce au dédoublonnage sur `eventId`.
+ */
+export class OrcheaEventFeed {
+  private readonly config: Pick<OrcheaConfig, 'baseUrl' | 'apiKey' | 'mode' | 'fetch' | 'timeoutMs'>;
+  private readonly receiver: OrcheaWebhookReceiver;
+  private readonly cursors: FeedCursors;
+  private readonly holder = randomUUID();
+  private readonly fetch: typeof fetch;
+  private readonly now: () => number;
+
+  constructor(config: OrcheaEventFeed['config'], receiver: OrcheaWebhookReceiver, options: { cursors?: FeedCursors; now?: () => number } = {}) {
+    this.config = config;
+    this.receiver = receiver;
+    this.cursors = options.cursors ?? new MemoryFeedCursors();
+    this.fetch = config.fetch ?? globalThis.fetch;
+    this.now = options.now ?? Date.now;
+  }
+
+  async catchUp(): Promise<CatchUpReport> {
+    const report: CatchUpReport = { status: 'done', pages: 0, events: 0, applied: 0 };
+    const held = await this.cursors.lease(FEED_SOURCE, this.holder, this.now() + FEED_LEASE_MS, this.now());
+    if (held === undefined) return { ...report, status: 'busy' };
+    let cursor = held ?? undefined;
+    try {
+      while (report.pages < FEED_MAX_PAGES) {
+        const url = new URL('/v1/events', this.config.baseUrl);
+        url.searchParams.set('limit', String(FEED_PAGE));
+        if (cursor) url.searchParams.set('cursor', cursor);
+        const response = await this.fetch(url, {
+          headers: { authorization: `Bearer ${this.config.apiKey}`, ...(this.config.mode ? { 'orchea-mode': this.config.mode } : {}) },
+          signal: AbortSignal.timeout(this.config.timeoutMs ?? 10_000),
+        });
+        if (!response.ok) throw new Error(`GET /v1/events : ${response.status}`);
+        const page = await response.json() as { items?: unknown[]; nextCursor?: string | null; hasMore?: boolean };
+        if (!Array.isArray(page.items)) throw new Error('GET /v1/events : réponse sans items');
+        for (const item of page.items) {
+          const event = parseEnvelope(JSON.stringify(item));
+          if (!event) continue;
+          report.events += 1;
+          if ((await this.receiver.apply(event)).result === 'applied') report.applied += 1;
+        }
+        report.pages += 1;
+        if (page.nextCursor && page.nextCursor !== cursor) {
+          // Le bail a pu passer à une autre instance (passage trop long) : elle reprend, on s'arrête.
+          if (!await this.cursors.advance(FEED_SOURCE, this.holder, page.nextCursor)) return { ...report, status: 'busy' };
+          cursor = page.nextCursor;
+        }
+        if (!page.hasMore) break;
+      }
+      return report;
+    } catch (error) {
+      return { ...report, status: 'error', error: (error as Error).message };
+    } finally {
+      await this.cursors.release(FEED_SOURCE, this.holder);
+    }
   }
 }
 

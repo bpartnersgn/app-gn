@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import type { AppStore, CitizenSpace, DeskCollection, Directory, DirectoryStore, Membership, Person, Role, Space, VaultDocument, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
 import type { AuthStore, Challenge, ChallengePurpose } from '../auth.ts';
-import type { ProcessedEvents } from '../orchea.ts';
+import type { FeedCursors, ProcessedEvents } from '../orchea.ts';
 import type { RateLimitStore } from '../security.ts';
 
 /**
@@ -70,7 +70,7 @@ export async function migrate(sql: Sql, migrations?: readonly Migration[]): Prom
 
 type Json<T> = { document: T };
 
-export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore, RateLimitStore, DirectoryStore {
+export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, DeskStore, RateLimitStore, DirectoryStore, FeedCursors {
   private readonly sql: Sql;
   constructor(sql: Sql) {
     this.sql = sql;
@@ -340,6 +340,29 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, Desk
       [document.id, document.spaceId, document.verificationCode ?? null, JSON.stringify(document)],
     );
     return rows.length === 1;
+  }
+
+
+  // ── Flux d'événements ORCHEA ──
+
+  async lease(source: string, holder: string, until: number, now: number): Promise<string | null | undefined> {
+    const { rows } = await this.sql.query<{ cursor: string | null }>(
+      `INSERT INTO feed_cursors (source, cursor, holder, leased_until) VALUES ($1, NULL, $2, $3)
+       ON CONFLICT (source) DO UPDATE SET holder = EXCLUDED.holder, leased_until = EXCLUDED.leased_until
+       WHERE feed_cursors.holder IS NULL OR feed_cursors.holder = EXCLUDED.holder OR feed_cursors.leased_until <= $4
+       RETURNING cursor`,
+      [source, holder, until, now],
+    );
+    return rows.length === 0 ? undefined : rows[0]!.cursor;
+  }
+
+  async advance(source: string, holder: string, cursor: string): Promise<boolean> {
+    const { rows } = await this.sql.query('UPDATE feed_cursors SET cursor = $3 WHERE source = $1 AND holder = $2 RETURNING source', [source, holder, cursor]);
+    return rows.length === 1;
+  }
+
+  async release(source: string, holder: string): Promise<void> {
+    await this.sql.query('UPDATE feed_cursors SET holder = NULL, leased_until = 0 WHERE source = $1 AND holder = $2', [source, holder]);
   }
 
 }

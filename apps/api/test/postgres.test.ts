@@ -45,7 +45,7 @@ describe('PostgreSQL', () => {
   it('le schéma se rejoue sans erreur', async () => {
     await migrate(sql);
     const { rows } = await sql.query<{ version: number }>('SELECT version FROM schema_version');
-    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3, 4]);
+    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3, 4, 5]);
   });
 
   it('une base déjà en version 2 ne reçoit que les migrations suivantes ; une migration qui échoue ne laisse rien', async () => {
@@ -55,17 +55,30 @@ describe('PostgreSQL', () => {
     try {
       const migrations = await loadMigrations();
       assert.deepEqual(await migrate(local, migrations.slice(0, 2)), [1, 2]);
-      assert.deepEqual(await migrate(local, migrations), [3, 4]);
+      assert.deepEqual(await migrate(local, migrations), [3, 4, 5]);
       assert.deepEqual(await migrate(local, migrations), []);
-      const broken = { version: 5, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
-      await assert.rejects(migrate(local, [...migrations, broken]), /migration 5 \(essai\)/);
+      const broken = { version: 6, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
+      await assert.rejects(migrate(local, [...migrations, broken]), /migration 6 \(essai\)/);
       const { rows } = await local.query<{ found: string | null }>("SELECT to_regclass('essai_rollback')::text AS found");
       assert.equal(rows[0]?.found, null);
       const versions = await local.query<{ version: number }>('SELECT version FROM schema_version ORDER BY version');
-      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3, 4]);
+      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3, 4, 5]);
     } finally {
       await database.close();
     }
+  });
+
+  it('flux ORCHEA : un seul bail à la fois, le curseur n’avance que pour qui le tient', async () => {
+    const other = new PostgresStore(sql);
+    assert.equal(await store.lease('essai', 'a', 2000, 1000), null);
+    assert.equal(await other.lease('essai', 'b', 2000, 1000), undefined);
+    assert.equal(await store.advance('essai', 'a', 'c1'), true);
+    assert.equal(await other.advance('essai', 'b', 'c9'), false);
+    // Bail expiré : une autre instance le reprend, et la première ne peut plus avancer.
+    assert.equal(await other.lease('essai', 'b', 5000, 2500), 'c1');
+    assert.equal(await store.advance('essai', 'a', 'c0'), false);
+    await other.release('essai', 'b');
+    assert.equal(await store.lease('essai', 'a', 9000, 3000), 'c1');
   });
 
   it('les compteurs de débit sont partagés et repartent à chaque minute', async () => {

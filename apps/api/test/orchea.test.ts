@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { createDemoApp, DEMO_WALLET_NUMBERS, money, SimulatedOrchestrator, toMajor } from '@app-gn/core';
 import { buildServer } from '../src/app.ts';
-import { OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromEnvironment, signOrcheaWebhook, verifyOrcheaSignature } from '../src/orchea.ts';
+import { MemoryFeedCursors, OrcheaEventFeed, OrcheaOrchestrator, OrcheaWebhookReceiver, orcheaFromEnvironment, signOrcheaWebhook, verifyOrcheaSignature } from '../src/orchea.ts';
 
 const SECRET = 'whsec_test_0123456789abcdef';
 const as = (personId: string) => ({ authorization: `Bearer demo:${personId}`, 'appgn-channel': 'phone', 'idempotency-key': crypto.randomUUID() });
@@ -40,7 +40,7 @@ const payBill = (server: ReturnType<typeof setup>['server'], sourceAccountId = '
   payload: { sourceAccountId, amount: '45000', destination: { type: 'biller', billerId: 'edg', customerReference: 'CPT-778899' } },
 });
 
-function event(type: string, payload: Record<string, unknown>, eventId = crypto.randomUUID()) {
+function event(type: string, payload: Record<string, unknown>, eventId: string = crypto.randomUUID()) {
   return JSON.stringify({ eventId, type, version: 1, occurredAt: new Date().toISOString(), tenantId: 'org', correlationId: 'c', idempotencyKey: 'k', payload });
 }
 
@@ -151,5 +151,81 @@ describe('ORCHEA', () => {
     assert.equal(toMajor(money(45000, 'GNF')), '45000');
     assert.equal(toMajor(money(1050, 'USD')), '10.50');
     assert.equal(toMajor(money(5, 'EUR')), '0.05');
+  });
+});
+
+describe('ORCHEA : rattrapage par le flux d’événements', () => {
+  /** Un flux de test : des pages fixes, chaque `cursor` menant à la suivante. */
+  function feedServer(pages: { items: unknown[]; nextCursor: string; hasMore: boolean }[], failAt?: number) {
+    const asked: (string | null)[] = [];
+    const fetchImpl = (async (input: URL | string, init?: RequestInit) => {
+      const url = new URL(String(input));
+      assert.equal(url.pathname, '/v1/events');
+      assert.equal((init?.headers as Record<string, string>).authorization, 'Bearer sk_test');
+      const cursor = url.searchParams.get('cursor');
+      asked.push(cursor);
+      const index = cursor ? Number(cursor.slice(1)) : 0;
+      if (failAt === index) return Response.json({ error: 'unavailable' }, { status: 503 });
+      return Response.json(pages[index] ?? { items: [], nextCursor: cursor, hasMore: false });
+    }) as typeof fetch;
+    return { asked, fetchImpl };
+  }
+
+  const body = (raw: string) => JSON.parse(raw) as Record<string, unknown>;
+
+  it('un webhook perdu est rattrapé : le paiement passe de « en cours » à payé, une seule fois', async () => {
+    const { app, server } = setup();
+    const payment = (await payBill(server)).json();
+    assert.equal(payment.status, 'processing');
+    const lost = event('TransactionConfirmed', { paymentIntentId: 'pi_1', status: 'CONFIRMED', externalReference: payment.id }, 'evt-lost');
+    const other = event('PaymentAttemptUnknown', { paymentIntentId: 'pi_x' }, 'evt-other');
+    const flux = feedServer([
+      { items: [body(other)], nextCursor: 'c1', hasMore: true },
+      { items: [body(lost)], nextCursor: 'c2', hasMore: false },
+    ]);
+    const receiver = new OrcheaWebhookReceiver(app, [SECRET]);
+    const cursors = new MemoryFeedCursors();
+    const feed = new OrcheaEventFeed({ baseUrl: 'https://orchea.test', apiKey: 'sk_test', fetch: flux.fetchImpl }, receiver, { cursors });
+    assert.deepEqual(await feed.catchUp(), { status: 'done', pages: 2, events: 2, applied: 1 });
+    const list = await server.inject({ method: 'GET', url: '/v1/spaces/spc_cit_mariama/payments', headers: as('per_mariama') });
+    assert.equal(list.json().find((candidate: { id: string }) => candidate.id === payment.id).status, 'completed');
+    // Le passage suivant repart du curseur gardé ; le webhook arrivé en retard est un doublon.
+    assert.deepEqual(await feed.catchUp(), { status: 'done', pages: 1, events: 0, applied: 0 });
+    assert.deepEqual(flux.asked, [null, 'c1', 'c2']);
+    assert.equal((await receiver.apply(JSON.parse(lost))).result, 'duplicate');
+  });
+
+  it('une page en erreur : le curseur reste à la dernière page traitée, le passage suivant la reprend', async () => {
+    const { app } = setup();
+    const flux = feedServer([
+      { items: [body(event('PaymentAttemptUnknown', { paymentIntentId: 'pi_a' }))], nextCursor: 'c1', hasMore: true },
+      { items: [], nextCursor: 'c1', hasMore: false },
+    ], 1);
+    const cursors = new MemoryFeedCursors();
+    const feed = new OrcheaEventFeed({ baseUrl: 'https://orchea.test', apiKey: 'sk_test', fetch: flux.fetchImpl }, new OrcheaWebhookReceiver(app, [SECRET]), { cursors });
+    const failed = await feed.catchUp();
+    assert.equal(failed.status, 'error');
+    assert.match(failed.error ?? '', /503/);
+    await feed.catchUp();
+    assert.deepEqual(flux.asked, [null, 'c1', 'c1']);
+  });
+
+  it('une seule instance lit le flux à la fois', async () => {
+    const { app } = setup();
+    const cursors = new MemoryFeedCursors();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const slow = (async () => {
+      await gate;
+      return Response.json({ items: [], nextCursor: null, hasMore: false });
+    }) as typeof fetch;
+    const one = new OrcheaEventFeed({ baseUrl: 'https://orchea.test', apiKey: 'sk_test', fetch: slow }, new OrcheaWebhookReceiver(app, [SECRET]), { cursors });
+    const two = new OrcheaEventFeed({ baseUrl: 'https://orchea.test', apiKey: 'sk_test', fetch: slow }, new OrcheaWebhookReceiver(app, [SECRET]), { cursors });
+    const running = one.catchUp();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await two.catchUp()).status, 'busy');
+    release();
+    assert.equal((await running).status, 'done');
+    assert.equal((await two.catchUp()).status, 'done');
   });
 });
