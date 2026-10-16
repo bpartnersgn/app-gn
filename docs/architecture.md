@@ -213,10 +213,12 @@ Le port `AppStore` (`packages/core/src/store.ts`) garde ce qui doit survivre à 
 
 Les bureaux GAPP gardent leurs enregistrements (factures, lots, engagements, mandats, agents, journaux) dans `desk_records` : JSONB versionné, écrit par `UPDATE … WHERE version = …`, ce qui donne des numéros sans trou et des crédits engagés jamais dépassés, même à plusieurs instances.
 
-Le schéma vient des migrations numérotées `db/migrations/NNN-*.sql` (socle, bureaux GAPP, limites de débit, référentiel, flux ORCHEA), appliquées au démarrage dans l'ordre, chacune dans sa transaction, sous un verrou consultatif : deux instances qui démarrent ensemble n'appliquent rien deux fois. Les objets sont gardés en JSONB, dans la forme exacte du noyau, avec en colonnes ce qui sert à chercher et à verrouiller. Chaque garantie tient dans une seule instruction SQL, donc plusieurs instances peuvent partager la base :
+Le schéma vient des migrations numérotées `db/migrations/NNN-*.sql` (socle, bureaux GAPP, limites de débit, référentiel, flux ORCHEA, cartes partagées), appliquées au démarrage dans l'ordre, chacune dans sa transaction, sous un verrou consultatif : deux instances qui démarrent ensemble n'appliquent rien deux fois. Les objets sont gardés en JSONB, dans la forme exacte du noyau, avec en colonnes ce qui sert à chercher et à verrouiller. Chaque garantie tient dans une seule instruction SQL, donc plusieurs instances peuvent partager la base :
 - une clé d'idempotence se réserve par `INSERT … ON CONFLICT DO NOTHING` avant tout effet, et se libère si la demande est refusée ;
 - un paiement ne change d'état que s'il est encore dans l'état attendu (`UPDATE … WHERE status = …`) : deux visas simultanés d'un même mandat n'en paient qu'un ;
-- un code de connexion se consomme par `DELETE … RETURNING` : un seul essai simultané l'emporte.
+- un code de connexion se consomme par `DELETE … RETURNING` : un seul essai simultané l'emporte ;
+- un devis de conversion aussi : accepté au même moment sur deux instances, il ne sert qu'une fois ;
+- une carte émise prend une place (1 à 3) de son espace et de son type sous un index unique : deux émissions simultanées ne dépassent pas le plafond.
 
 Vérifié le 12/10/2026 sur PGlite et sur PostgreSQL 16 (mêmes tests, `TEST_DATABASE_URL`), et par redémarrage du serveur : session, paiement, rejeu par la même clé, carte émise et révocation retrouvés.
 
@@ -232,7 +234,7 @@ Le référentiel (personnes, espaces, rattachements, comptes liés, documents) e
 | `APPGN_RATE_PER_IP`, `APPGN_RATE_PER_SESSION`, `APPGN_RATE_WRITES` | demandes par minute (600, 300, 60) |
 | `ORCHEA_FEED_INTERVAL_MS` | rattrapage des événements ORCHEA (60 000) |
 
-Ce qui reste en mémoire : les devis de conversion (60 s) ; les cartes chargées au démarrage, ce qui suppose une seule instance tant que l'émission n'est pas relue en base à chaque demande.
+Les cartes d'un espace citoyen sont relues en base à chaque demande qui les touche (liste, vue consolidée, paiement, devis, conversion, blocage) : une carte émise ou bloquée sur une instance l'est aussitôt sur les autres. Les devis de conversion (60 s) sont en base (`exchange_quotes`). Plus rien n'impose une seule instance de l'API (vérifié le 16/10/2026 sur PostgreSQL 16 : deux instances sur la même base, émissions simultanées, blocage croisé, même devis accepté deux fois).
 
 ## 13. Stack
 

@@ -185,7 +185,7 @@ export function buildServer(app: AppGn, options: ServerOptions = {}): FastifyIns
     app.setCardFrozen(await actorOf(request), request.params.spaceId, request.params.accountId, false));
 
   server.post<{ Params: { spaceId: string }; Body: ExchangeInput }>('/v1/spaces/:spaceId/exchange-quotes', async (request, reply) =>
-    reply.status(201).send(app.quoteExchange(await actorOf(request), request.params.spaceId, request.body ?? ({} as ExchangeInput))));
+    reply.status(201).send(await app.quoteExchange(await actorOf(request), request.params.spaceId, request.body ?? ({} as ExchangeInput))));
 
   server.post<{ Params: { spaceId: string }; Body: { quoteId: string } }>('/v1/spaces/:spaceId/exchanges', async (request, reply) => {
     const exchange = await app.executeExchange(await actorOf(request), request.params.spaceId, request.body?.quoteId ?? '', keyOf(request));

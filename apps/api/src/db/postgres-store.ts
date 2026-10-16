@@ -1,5 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
-import type { AppStore, CitizenSpace, DeskCollection, Directory, DirectoryStore, Membership, Person, Role, Space, VaultDocument, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
+import { QUOTE_TTL_SECONDS } from '@app-gn/core';
+import type { AppStore, CardStatus, ExchangeQuote, StoredCard, CitizenSpace, DeskCollection, Directory, DirectoryStore, Membership, Person, Role, Space, VaultDocument, DeskEntity, DeskStore, Exchange, IdempotencyRecord, LinkedAccount, Payment, PaymentStatus, Versioned, VirtualCard } from '@app-gn/core';
 import type { AuthStore, Challenge, ChallengePurpose } from '../auth.ts';
 import type { FeedCursors, ProcessedEvents } from '../orchea.ts';
 import type { RateLimitStore } from '../security.ts';
@@ -147,15 +148,53 @@ export class PostgresStore implements AppStore, AuthStore, ProcessedEvents, Desk
     return rows[0]?.document;
   }
 
-  async saveCard(card: VirtualCard, account?: LinkedAccount): Promise<void> {
-    await this.sql.query(
-      `INSERT INTO issued_cards (account_id, space_id, card, account) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (account_id) DO UPDATE SET card = EXCLUDED.card, account = COALESCE(EXCLUDED.account, issued_cards.account)`,
-      [card.accountId, card.spaceId, JSON.stringify(card), account ? JSON.stringify(account) : null],
-    );
+  async saveQuote(quote: ExchangeQuote): Promise<void> {
+    const expiresAt = Date.parse(quote.expiresAt);
+    // Les devis expirés depuis au moins une durée de vie partent au passage.
+    await this.sql.query('DELETE FROM exchange_quotes WHERE expires_at < $1', [expiresAt - 2 * QUOTE_TTL_SECONDS * 1000]);
+    await this.sql.query('INSERT INTO exchange_quotes (id, expires_at, document) VALUES ($1, $2, $3)', [quote.id, expiresAt, JSON.stringify(quote)]);
   }
 
-  async issuedCards(): Promise<{ card: VirtualCard; account?: LinkedAccount }[]> {
+  async quote(id: string): Promise<ExchangeQuote | undefined> {
+    const { rows } = await this.sql.query<Json<ExchangeQuote>>('SELECT document FROM exchange_quotes WHERE id = $1', [id]);
+    return rows[0]?.document;
+  }
+
+  async takeQuote(id: string): Promise<boolean> {
+    const { rows } = await this.sql.query('DELETE FROM exchange_quotes WHERE id = $1 RETURNING id', [id]);
+    return rows.length === 1;
+  }
+
+  async insertCard(card: VirtualCard, account: LinkedAccount | undefined, maxPerTier: number): Promise<boolean> {
+    // Une place par carte (index unique espace, type, place) : deux émissions simultanées ne prennent pas la même,
+    // et la perdante essaie la suivante. Plus de place libre : refus.
+    for (let slot = 1; slot <= maxPerTier; slot++) {
+      const { rows } = await this.sql.query(
+        `INSERT INTO issued_cards (account_id, space_id, tier, slot, card, account) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT DO NOTHING RETURNING account_id`,
+        [card.accountId, card.spaceId, card.tier, slot, JSON.stringify(card), account ? JSON.stringify(account) : null],
+      );
+      if (rows.length === 1) return true;
+      const existing = await this.sql.query('SELECT 1 FROM issued_cards WHERE account_id = $1', [card.accountId]);
+      if (existing.rows.length === 1) return true;
+    }
+    return false;
+  }
+
+  async setCardStatus(accountId: string, status: CardStatus): Promise<VirtualCard | undefined> {
+    const { rows } = await this.sql.query<{ card: VirtualCard }>(
+      `UPDATE issued_cards SET card = jsonb_set(card, '{status}', to_jsonb($2::text)) WHERE account_id = $1 RETURNING card`,
+      [accountId, status],
+    );
+    return rows[0]?.card;
+  }
+
+  async cardsOfSpace(spaceId: string): Promise<StoredCard[]> {
+    const { rows } = await this.sql.query<{ card: VirtualCard; account: LinkedAccount | null }>('SELECT card, account FROM issued_cards WHERE space_id = $1 ORDER BY account_id', [spaceId]);
+    return rows.map((row) => (row.account ? { card: row.card, account: row.account } : { card: row.card }));
+  }
+
+  async issuedCards(): Promise<StoredCard[]> {
     const { rows } = await this.sql.query<{ card: VirtualCard; account: LinkedAccount | null }>('SELECT card, account FROM issued_cards ORDER BY account_id');
     return rows.map((row) => (row.account ? { card: row.card, account: row.account } : { card: row.card }));
   }

@@ -104,6 +104,8 @@ export interface AppGnDependencies {
   directory?: DirectoryStore;
   /** Envoi et vérification des codes de confirmation forte. Par défaut : code montré (démonstration). */
   confirmer?: Confirmer;
+  /** Rouvre chez son fournisseur le compte d'une carte que cette instance découvre (émise ailleurs ou avant le démarrage). */
+  openCardAccount?: (account: LinkedAccount) => void;
 }
 
 export interface RegistrationInput {
@@ -131,7 +133,8 @@ export class AppGn {
   private readonly deps: AppGnDependencies;
   private readonly aggregator: Aggregator;
   private readonly store: AppStore;
-  private readonly quotes = new Map<string, ExchangeQuote>();
+  /** Cartes de la copie de travail déjà enregistrées dans le magasin. */
+  private readonly storedCards = new Set<string>();
   private readonly now: () => Date;
   private readonly directory: DirectoryStore;
   private confirmer: Confirmer;
@@ -152,19 +155,15 @@ export class AppGn {
   }
 
   /**
-   * Reprend l'état gardé par le magasin (cartes émises, cartes bloquées) au démarrage.
-   * Rend les comptes de carte recréés, pour que l'appelant les rouvre chez leur fournisseur.
+   * Reprend l'état gardé par le magasin (cartes émises, cartes bloquées) au démarrage. Ensuite, chaque demande qui
+   * touche une carte relit celles de son espace : une autre instance a pu en émettre, en bloquer ou en débloquer.
+   * Rend les comptes de carte recréés (déjà passés à `openCardAccount`).
    */
   async load(): Promise<LinkedAccount[]> {
     const restored: LinkedAccount[] = [];
     for (const { card, account } of await this.store.issuedCards()) {
-      const index = this.deps.cards.findIndex((candidate) => candidate.accountId === card.accountId);
-      if (index >= 0) this.deps.cards[index] = card;
-      else this.deps.cards.push(card);
-      if (account && !this.deps.accounts.some((candidate) => candidate.id === account.id)) {
-        this.deps.accounts.push(account);
-        restored.push(account);
-      }
+      const opened = this.adoptCard(card, account);
+      if (opened) restored.push(opened);
     }
     return restored;
   }
@@ -351,12 +350,14 @@ export class AppGn {
   }
 
   async overview(actor: Actor, spaceId: string): Promise<ConsolidatedView> {
-    this.authorize(actor, spaceId, 'accounts:read');
+    const { space } = this.authorize(actor, spaceId, 'accounts:read');
+    await this.syncCards(space);
     return this.aggregator.consolidate(spaceId, this.accountsOf(spaceId));
   }
 
   async transactions(actor: Actor, spaceId: string, accountId: string, limit = 20): Promise<AccountTransaction[]> {
-    this.authorize(actor, spaceId, 'accounts:read');
+    const { space } = this.authorize(actor, spaceId, 'accounts:read');
+    await this.syncCards(space);
     const account = this.account(spaceId, accountId);
     const connector = this.deps.connectors.get(account.providerId);
     if (!connector) throw new AppError('not_found', 'aucun connecteur pour ce compte');
@@ -409,6 +410,8 @@ export class AppGn {
   async initiatePayment(actor: Actor, spaceId: string, input: PaymentInput, idempotencyKey: string, origin?: 'desk'): Promise<Payment> {
     const { space, role } = this.authorize(actor, spaceId, 'payments:initiate');
     this.assertPublicChain(space, origin);
+    // Une carte bloquée sur une autre instance refuse le débit ici aussi.
+    await this.syncCards(space);
     const id = this.nextId('pay');
     const claim = this.scope(actor, spaceId, 'payment', idempotencyKey);
     const replay = await this.claim(claim, [input.sourceAccountId, input.amount, input.destination, input.label ?? null], id);
@@ -494,28 +497,26 @@ export class AppGn {
 
   // ── Cartes virtuelles et conversions ───────────────────────────────────────
 
-  cards(actor: Actor, spaceId: string): CardView[] {
-    this.authorize(actor, spaceId, 'accounts:read');
-    return this.deps.cards
-      .filter((card) => card.spaceId === spaceId)
-      .map((card) => {
-        const account = this.account(spaceId, card.accountId);
-        return { ...card, label: account.label, currency: account.currency };
-      });
+  async cards(actor: Actor, spaceId: string): Promise<CardView[]> {
+    const { space } = this.authorize(actor, spaceId, 'accounts:read');
+    await this.syncCards(space);
+    return this.cardViews(spaceId);
   }
 
   async issueCard(actor: Actor, spaceId: string, request: { network: CardNetwork; tier: CardTier; currency?: Currency }, idempotencyKey: string): Promise<CardView> {
-    this.authorize(actor, spaceId, 'cards:manage');
+    const { space } = this.authorize(actor, spaceId, 'cards:manage');
     const accountId = this.nextId('acc_card');
     const claim = this.scope(actor, spaceId, 'card', idempotencyKey);
     const replay = await this.claim(claim, [request.network, request.tier, request.currency ?? 'USD'], accountId);
-    if (replay) return this.replayed(this.cards(actor, spaceId).find((card) => card.accountId === replay));
+    if (replay) return this.replayed((await this.cards(actor, spaceId)).find((card) => card.accountId === replay));
     const currency = request.currency ?? 'USD';
     let issued: { account: LinkedAccount; card: VirtualCard };
     try {
       if (!['visa', 'mastercard'].includes(request.network)) throw new AppError('invalid_request', 'réseau de carte inconnu');
       if (!['standard', 'gold'].includes(request.tier)) throw new AppError('invalid_request', 'type de carte inconnu');
       if (currency !== 'USD' && currency !== 'GNF') throw new AppError('invalid_request', 'une carte est en USD ou en GNF');
+      await this.syncCards(space);
+      await this.storeSeedCards(spaceId);
       const sameTier = this.deps.cards.filter((card) => card.spaceId === spaceId && card.tier === request.tier).length;
       if (sameTier >= MAX_CARDS_PER_TIER) throw new AppError('invalid_state', `au plus ${MAX_CARDS_PER_TIER} cartes de ce type`);
       issued = await this.deps.cardIssuer.issue({
@@ -526,31 +527,40 @@ export class AppGn {
         holderName: this.person(actor.personId).fullName,
         currency,
       });
+      // Le plafond tient dans le magasin : une émission simultanée sur une autre instance a pu prendre la dernière place.
+      // La carte déjà émise chez l'émetteur est alors bloquée, et jamais montrée.
+      if (!await this.store.insertCard(issued.card, issued.account, MAX_CARDS_PER_TIER)) {
+        await this.deps.cardIssuer.setFrozen(issued.card, true).catch(() => undefined);
+        throw new AppError('invalid_state', `au plus ${MAX_CARDS_PER_TIER} cartes de ce type`);
+      }
     } catch (error) {
       await this.store.releaseIdempotency(claim);
       throw error;
     }
     const { account, card } = issued;
-    await this.store.saveCard(card, account);
-    this.deps.accounts.push(account);
-    this.deps.cards.push(card);
+    // Le compte est déjà ouvert chez l'émetteur : pas besoin de le rouvrir.
+    this.adoptCard(card, account, false);
     return { ...card, label: account.label, currency };
   }
 
   async setCardFrozen(actor: Actor, spaceId: string, accountId: string, frozen: boolean): Promise<CardView> {
-    this.authorize(actor, spaceId, 'cards:manage');
+    const { space } = this.authorize(actor, spaceId, 'cards:manage');
+    await this.syncCards(space);
     const card = this.deps.cards.find((candidate) => candidate.accountId === accountId && candidate.spaceId === spaceId);
     if (!card) throw new AppError('not_found', 'carte introuvable');
+    await this.storeSeedCards(spaceId);
     await this.deps.cardIssuer.setFrozen(card, frozen);
-    card.status = frozen ? 'frozen' : 'active';
-    await this.store.saveCard(card);
-    return this.cards(actor, spaceId).find((candidate) => candidate.accountId === accountId)!;
+    const saved = await this.store.setCardStatus(accountId, frozen ? 'frozen' : 'active');
+    if (!saved) throw new AppError('not_found', 'carte introuvable');
+    this.adoptCard(saved);
+    return this.cardViews(spaceId).find((candidate) => candidate.accountId === accountId)!;
   }
 
   /** Devis d'une conversion entre deux comptes de l'espace citoyen : montant, frais et cours affichés avant d'accepter. */
-  quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput): ExchangeQuote {
+  async quoteExchange(actor: Actor, spaceId: string, input: ExchangeInput): Promise<ExchangeQuote> {
     const { space } = this.authorize(actor, spaceId, 'payments:initiate');
     if (space.kind !== 'citizen') throw new AppError('invalid_request', 'la conversion est réservée à l’espace citoyen pour l’instant');
+    await this.syncCards(space);
     const source = this.account(spaceId, input.sourceAccountId);
     const target = this.account(spaceId, input.targetAccountId);
     if (source.id === target.id) throw new AppError('invalid_request', 'choisissez deux comptes différents');
@@ -581,30 +591,33 @@ export class AppGn {
       rates,
       expiresAt: new Date(this.now().getTime() + QUOTE_TTL_SECONDS * 1000).toISOString(),
     };
-    this.quotes.set(quote.id, quote);
+    await this.store.saveQuote(quote);
     return quote;
   }
 
   async executeExchange(actor: Actor, spaceId: string, quoteId: string, idempotencyKey: string): Promise<Exchange> {
-    this.authorize(actor, spaceId, 'payments:initiate');
+    const { space } = this.authorize(actor, spaceId, 'payments:initiate');
     const id = this.nextId('xch');
     const claim = this.scope(actor, spaceId, 'exchange', idempotencyKey);
     const replay = await this.claim(claim, [quoteId], id);
     if (replay) return this.replayed(await this.store.exchange(replay));
-    const quote = this.quotes.get(quoteId);
+    let quote: ExchangeQuote | undefined;
     let source: LinkedAccount;
     let target: LinkedAccount;
     try {
+      quote = await this.store.quote(quoteId);
       if (!quote || quote.spaceId !== spaceId || quote.personId !== actor.personId) throw new AppError('not_found', 'devis introuvable');
       if (Date.parse(quote.expiresAt) <= this.now().getTime()) throw new AppError('invalid_state', 'devis expiré : demandez-en un nouveau');
+      await this.syncCards(space);
       source = this.account(spaceId, quote.sourceAccountId);
       target = this.account(spaceId, quote.targetAccountId);
       this.assertCardUsable(source);
+      // Un devis ne sert qu'une fois, même accepté au même moment sur deux instances sous deux clés différentes.
+      if (!await this.store.takeQuote(quoteId)) throw new AppError('not_found', 'devis introuvable');
     } catch (error) {
       await this.store.releaseIdempotency(claim);
       throw error;
     }
-    this.quotes.delete(quoteId);
     const exchange: Exchange = {
       id,
       quoteId,
@@ -747,6 +760,49 @@ export class AppGn {
     if (space.kind === 'administration' && origin !== 'desk') {
       throw new AppError('invalid_request', 'en administration, une dépense passe par l’engagement, la liquidation, le mandat et le visa du comptable');
     }
+  }
+
+  /**
+   * Relit les cartes de l'espace dans le magasin : une autre instance a pu en émettre, en bloquer ou en débloquer.
+   * Les cartes ne vivent que dans l'espace citoyen ; ailleurs, rien à relire.
+   */
+  private async syncCards(space: Space): Promise<void> {
+    if (space.kind !== 'citizen') return;
+    for (const { card, account } of await this.store.cardsOfSpace(space.id)) this.adoptCard(card, account);
+  }
+
+  /**
+   * Remplace la carte dans la copie de travail par son état enregistré. Rend son compte s'il était inconnu ici :
+   * il est alors ajouté et, sauf `open = false`, rouvert chez son fournisseur.
+   */
+  private adoptCard(card: VirtualCard, account?: LinkedAccount, open = true): LinkedAccount | undefined {
+    this.storedCards.add(card.accountId);
+    const index = this.deps.cards.findIndex((candidate) => candidate.accountId === card.accountId);
+    if (index >= 0) this.deps.cards[index] = card;
+    else this.deps.cards.push(card);
+    if (!account || this.deps.accounts.some((candidate) => candidate.id === account.id)) return undefined;
+    this.deps.accounts.push(account);
+    if (open) this.deps.openCardAccount?.(account);
+    return account;
+  }
+
+  /**
+   * Les cartes venues du référentiel (démonstration) entrent au magasin à la première écriture dans leur espace :
+   * elles comptent alors dans le plafond partagé, et leur blocage se relit d'une instance à l'autre.
+   */
+  private async storeSeedCards(spaceId: string): Promise<void> {
+    for (const card of this.deps.cards.filter((candidate) => candidate.spaceId === spaceId && !this.storedCards.has(candidate.accountId))) {
+      if (await this.store.insertCard(card, undefined, MAX_CARDS_PER_TIER)) this.storedCards.add(card.accountId);
+    }
+  }
+
+  private cardViews(spaceId: string): CardView[] {
+    return this.deps.cards
+      .filter((card) => card.spaceId === spaceId)
+      .map((card) => {
+        const account = this.account(spaceId, card.accountId);
+        return { ...card, label: account.label, currency: account.currency };
+      });
   }
 
   private assertCardUsable(account: LinkedAccount): void {
@@ -924,6 +980,7 @@ export function createDemoApp(options: DemoOptions = {}): { app: AppGn; network:
     connectors,
     orchestrator: options.orchestrator?.(network, now) ?? new SimulatedOrchestrator(network, now),
     cardIssuer: new SimulatedCardIssuer(network, now),
+    openCardAccount: (account) => network.open(account, []),
     fx: DEMO_FX,
     now,
     aggregationTimeoutMs: options.aggregationTimeoutMs,
@@ -941,6 +998,6 @@ export async function loadDemoApp(options: DemoOptions = {}): Promise<{ app: App
     if (current.persons.length === 0 && options.seedDirectory !== false) await seedDirectory(options.directory, demo.app.snapshot());
     await demo.app.refresh();
   }
-  for (const account of await demo.app.load()) demo.network.open(account, []);
+  await demo.app.load();
   return demo;
 }

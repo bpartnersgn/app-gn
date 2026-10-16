@@ -1,6 +1,12 @@
-import type { Exchange, VirtualCard } from './cards.ts';
+import type { CardStatus, Exchange, ExchangeQuote, VirtualCard } from './cards.ts';
 import type { LinkedAccount } from './model.ts';
 import type { Payment, PaymentStatus } from './payments.ts';
+
+export interface StoredCard {
+  card: VirtualCard;
+  /** Le compte de la carte, pour une carte émise par App GN ; absent pour une carte venue du référentiel. */
+  account?: LinkedAccount;
+}
 
 export interface IdempotencyRecord {
   fingerprint: string;
@@ -8,11 +14,9 @@ export interface IdempotencyRecord {
 }
 
 /**
- * Ce qu'App GN doit retrouver après un redémarrage : paiements, clés d'idempotence, conversions, cartes émises.
- * Deux implémentations : en mémoire (navigateur, tests, démo) et PostgreSQL (serveur, `apps/api/src/db`).
- *
- * Le référentiel (personnes, espaces, rattachements, comptes liés, documents) vient encore des données de
- * démonstration ; les devis de conversion (60 s) restent en mémoire.
+ * Ce qu'App GN doit retrouver après un redémarrage, et que plusieurs instances partagent : paiements, clés
+ * d'idempotence, devis et conversions, cartes émises et leur état. Deux implémentations : en mémoire (navigateur,
+ * tests, démo) et PostgreSQL (serveur, `apps/api/src/db`).
  */
 export interface AppStore {
   insertPayment(payment: Payment): Promise<void>;
@@ -33,15 +37,29 @@ export interface AppStore {
   saveExchange(exchange: Exchange): Promise<void>;
   exchange(id: string): Promise<Exchange | undefined>;
 
-  saveCard(card: VirtualCard, account?: LinkedAccount): Promise<void>;
-  issuedCards(): Promise<{ card: VirtualCard; account?: LinkedAccount }[]>;
+  /** Garde un devis de conversion, pour qu'il soit accepté depuis n'importe quelle instance. */
+  saveQuote(quote: ExchangeQuote): Promise<void>;
+  quote(id: string): Promise<ExchangeQuote | undefined>;
+  /** Consomme le devis : vrai pour un seul appel, même concurrent. */
+  takeQuote(id: string): Promise<boolean>;
+
+  /**
+   * Enregistre une carte si son type a encore une place dans l'espace (au plus `maxPerTier`), même sous émissions
+   * concurrentes depuis plusieurs instances. Vrai si la carte est enregistrée (par cet appel ou déjà avant).
+   */
+  insertCard(card: VirtualCard, account: LinkedAccount | undefined, maxPerTier: number): Promise<boolean>;
+  /** Bloque ou débloque une carte enregistrée ; rend la carte à jour, rien si elle n'est pas enregistrée. */
+  setCardStatus(accountId: string, status: CardStatus): Promise<VirtualCard | undefined>;
+  cardsOfSpace(spaceId: string): Promise<StoredCard[]>;
+  issuedCards(): Promise<StoredCard[]>;
 }
 
 export class MemoryAppStore implements AppStore {
   private readonly payments = new Map<string, Payment>();
   private readonly keys = new Map<string, IdempotencyRecord>();
   private readonly exchanges = new Map<string, Exchange>();
-  private readonly cards = new Map<string, { card: VirtualCard; account?: LinkedAccount }>();
+  private readonly quotes = new Map<string, ExchangeQuote>();
+  private readonly cards = new Map<string, StoredCard>();
 
   async insertPayment(payment: Payment): Promise<void> {
     if (this.payments.has(payment.id)) throw new Error(`paiement ${payment.id} déjà enregistré`);
@@ -92,12 +110,39 @@ export class MemoryAppStore implements AppStore {
     return exchange && structuredClone(exchange);
   }
 
-  async saveCard(card: VirtualCard, account?: LinkedAccount): Promise<void> {
-    const previous = this.cards.get(card.accountId);
-    this.cards.set(card.accountId, structuredClone({ card, account: account ?? previous?.account }));
+  async saveQuote(quote: ExchangeQuote): Promise<void> {
+    this.quotes.set(quote.id, structuredClone(quote));
   }
 
-  async issuedCards(): Promise<{ card: VirtualCard; account?: LinkedAccount }[]> {
+  async quote(id: string): Promise<ExchangeQuote | undefined> {
+    const quote = this.quotes.get(id);
+    return quote && structuredClone(quote);
+  }
+
+  async takeQuote(id: string): Promise<boolean> {
+    return this.quotes.delete(id);
+  }
+
+  async insertCard(card: VirtualCard, account: LinkedAccount | undefined, maxPerTier: number): Promise<boolean> {
+    if (this.cards.has(card.accountId)) return true;
+    const sameTier = [...this.cards.values()].filter((entry) => entry.card.spaceId === card.spaceId && entry.card.tier === card.tier).length;
+    if (sameTier >= maxPerTier) return false;
+    this.cards.set(card.accountId, structuredClone(account ? { card, account } : { card }));
+    return true;
+  }
+
+  async setCardStatus(accountId: string, status: CardStatus): Promise<VirtualCard | undefined> {
+    const entry = this.cards.get(accountId);
+    if (!entry) return undefined;
+    entry.card.status = status;
+    return structuredClone(entry.card);
+  }
+
+  async cardsOfSpace(spaceId: string): Promise<StoredCard[]> {
+    return [...this.cards.values()].filter((entry) => entry.card.spaceId === spaceId).map((entry) => structuredClone(entry));
+  }
+
+  async issuedCards(): Promise<StoredCard[]> {
     return [...this.cards.values()].map((entry) => structuredClone(entry));
   }
 }

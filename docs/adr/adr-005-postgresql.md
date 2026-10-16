@@ -19,5 +19,5 @@ Jusqu'ici tout l'état d'App GN vivait en mémoire : un redémarrage perdait pai
 - Les identifiants de paiement, de conversion et de carte deviennent aléatoires (un compteur repartirait de zéro).
 - `listPayments`, `rejectPayment`, `recordOutcome` deviennent asynchrones.
 - Le référentiel (personnes, espaces, rattachements, comptes liés, documents) reste issu de la démonstration : il passera en base avec l'inscription et le rattachement de comptes.
-- Les cartes sont relues au démarrage seulement : tant que ce n'est pas changé, une seule instance de l'API.
+- Les cartes sont relues au démarrage seulement : tant que ce n'est pas changé, une seule instance de l'API. Levé le 16/10/2026 (ADR-008, point 9).
 - Pas encore de migrations au-delà de la version 1 : la prochaine modification du schéma introduira des fichiers numérotés.

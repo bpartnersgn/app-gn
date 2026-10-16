@@ -16,6 +16,7 @@ Demande du 14/10/2026 : « attaque le BackEnd ». L'API tournait, mais en démon
 6. **Rattrapage ORCHEA** : en plus des webhooks, `GET /v1/events` est lu page à page au démarrage et toutes les 60 s ; chaque événement passe par le même traitement (dédoublonné), le curseur est gardé en base sous bail, une seule instance lit à la fois.
 7. **Confirmation forte** : en entreprise, à partir de 5 M GNF (ou en devises), la personne qui fait partir l'argent (dirigeant qui paie, approbateur, lot exécuté, TVA déclarée) reçoit un code par SMS lié à l'opération exacte. L'API répond `428 confirmation_required` avec le défi ; la demande est renvoyée avec `AppGN-Confirmation: <défi>.<code>`. Un essai par code, 5 codes par 15 minutes.
 8. **SMS par Orange** (`apps/api/src/sms.ts`) : API SMS d'Orange (jeton OAuth, expéditeur attribué). Écrit d'après la documentation publique, non essayé faute de compte ; une panne rend `503 unavailable`.
+9. **Plusieurs instances de l'API** (16/10/2026, migration 6) : les cartes d'un espace citoyen sont relues en base à chaque demande qui les touche, le blocage s'écrit en base (`jsonb_set`), le plafond de 3 cartes par type tient dans un index unique sur (espace, type, place), et les devis de conversion sont en base, consommés par `DELETE … RETURNING`. Une carte que la base refuse après son émission (dernière place prise au même instant ailleurs) est bloquée chez l'émetteur et jamais montrée.
 
 ## Conséquences
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { AppError, convert, withDemoConfirmation, createDemoApp, formatMoney, MemoryStore, money, Outbox, parseMajor, SnapshotCache, toReference, type Actor, type Channel } from '../src/index.ts';
+import { AppError, convert, withDemoConfirmation, createDemoApp, formatMoney, MemoryAppStore, MemoryStore, money, Outbox, parseMajor, SnapshotCache, toReference, type Actor, type Channel } from '../src/index.ts';
 
 const fixedNow = () => new Date('2026-10-12T10:00:00Z');
 const A = (personId: string, channel: Channel = 'desktop'): Actor => ({ personId, channel });
@@ -276,7 +276,7 @@ describe('cartes et conversions', () => {
   it('recharge une carte depuis Orange Money : frais et cours affichés, puis exécution', async () => {
     const { app } = demo();
     const me = A('per_mariama', 'phone');
-    const quote = app.quoteExchange(me, 'spc_cit_mariama', { sourceAccountId: 'acc_mc_om', targetAccountId: 'acc_mc_card', amount: '432500' });
+    const quote = await app.quoteExchange(me, 'spc_cit_mariama', { sourceAccountId: 'acc_mc_om', targetAccountId: 'acc_mc_card', amount: '432500' });
     assert.equal(quote.feeBps, 200);
     assert.equal(quote.fee.amount, '8650');
     // (432 500 − 8 650) / 8 650 = 49,00 USD
@@ -293,7 +293,7 @@ describe('cartes et conversions', () => {
   it('un devis expire au bout d\u2019une minute', async () => {
     let clock = Date.parse('2026-10-12T10:00:00Z');
     const { app } = createDemoApp({ now: () => new Date(clock), aggregationTimeoutMs: 50 });
-    const quote = app.quoteExchange(A('per_mariama'), 'spc_cit_mariama', { sourceAccountId: 'acc_mc_usdt', targetAccountId: 'acc_mc_om', amount: '50' });
+    const quote = await app.quoteExchange(A('per_mariama'), 'spc_cit_mariama', { sourceAccountId: 'acc_mc_usdt', targetAccountId: 'acc_mc_om', amount: '50' });
     assert.equal(quote.feeBps, 100);
     clock += 61_000;
     await rejects(app.executeExchange(A('per_mariama'), 'spc_cit_mariama', quote.id, 'late'), 'invalid_state');
@@ -304,7 +304,7 @@ describe('cartes et conversions', () => {
     const me = A('per_mariama', 'phone');
     const card = await app.issueCard(me, 'spc_cit_mariama', { network: 'mastercard', tier: 'gold' }, 'c1');
     assert.equal(card.status, 'active');
-    assert.equal(app.cards(me, 'spc_cit_mariama').length, 2);
+    assert.equal((await app.cards(me, 'spc_cit_mariama')).length, 2);
     await app.setCardFrozen(me, 'spc_cit_mariama', 'acc_mc_card', true);
     await rejects(app.initiatePayment(me, 'spc_cit_mariama', {
       sourceAccountId: 'acc_mc_card', amount: '5', destination: { type: 'own_account', accountId: card.accountId },
@@ -321,6 +321,41 @@ describe('cartes et conversions', () => {
     const me = A('per_mariama');
     for (const key of ['a', 'b']) await app.issueCard(me, 'spc_cit_mariama', { network: 'visa', tier: 'standard' }, key);
     await rejects(app.issueCard(me, 'spc_cit_mariama', { network: 'visa', tier: 'standard' }, 'c'), 'invalid_state');
+  });
+
+  it('deux instances sur le même magasin : cartes, blocage, plafond et devis partagés', async () => {
+    const store = new MemoryAppStore();
+    const one = createDemoApp({ store, aggregationTimeoutMs: 50 }).app;
+    const two = createDemoApp({ store, aggregationTimeoutMs: 50 }).app;
+    const me = A('per_mariama', 'phone');
+
+    // Émise sur l'une, vue et utilisable sur l'autre.
+    const card = await one.issueCard(me, 'spc_cit_mariama', { network: 'visa', tier: 'gold' }, 'i1');
+    assert.ok((await two.cards(me, 'spc_cit_mariama')).some((candidate) => candidate.accountId === card.accountId));
+    assert.ok((await two.overview(me, 'spc_cit_mariama')).positions.some((position) => position.account.id === card.accountId));
+
+    // Bloquée sur l'une : l'autre refuse le débit, la conversion et le devis.
+    await one.setCardFrozen(me, 'spc_cit_mariama', 'acc_mc_card', true);
+    await rejects(two.initiatePayment(me, 'spc_cit_mariama', {
+      sourceAccountId: 'acc_mc_card', amount: '5', destination: { type: 'own_account', accountId: 'acc_mc_om' },
+    }, 'f1'), 'invalid_state');
+    await rejects(two.quoteExchange(me, 'spc_cit_mariama', { sourceAccountId: 'acc_mc_card', targetAccountId: 'acc_mc_om', amount: '5' }), 'invalid_state');
+    assert.equal((await two.cards(me, 'spc_cit_mariama')).find((candidate) => candidate.accountId === 'acc_mc_card')?.status, 'frozen');
+    await two.setCardFrozen(me, 'spc_cit_mariama', 'acc_mc_card', false);
+    assert.equal((await one.cards(me, 'spc_cit_mariama')).find((candidate) => candidate.accountId === 'acc_mc_card')?.status, 'active');
+
+    // Plafond : une carte Standard de démonstration, donc deux places ; trois émissions simultanées, deux passent.
+    const results = await Promise.allSettled([one, two, one].map((app, index) => app.issueCard(me, 'spc_cit_mariama', { network: 'visa', tier: 'standard' }, `s${index}`)));
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 2);
+    assert.equal((await two.cards(me, 'spc_cit_mariama')).filter((candidate) => candidate.tier === 'standard').length, 3);
+
+    // Devis fait sur l'une, accepté sur l'autre, une seule fois.
+    const quote = await one.quoteExchange(me, 'spc_cit_mariama', { sourceAccountId: 'acc_mc_om', targetAccountId: 'acc_mc_card', amount: '86500' });
+    const [first, second] = await Promise.allSettled([
+      two.executeExchange(me, 'spc_cit_mariama', quote.id, 'e1'),
+      one.executeExchange(me, 'spc_cit_mariama', quote.id, 'e2'),
+    ]);
+    assert.deepEqual([first.status, second.status].sort(), ['fulfilled', 'rejected']);
   });
 });
 

@@ -45,7 +45,7 @@ describe('PostgreSQL', () => {
   it('le schéma se rejoue sans erreur', async () => {
     await migrate(sql);
     const { rows } = await sql.query<{ version: number }>('SELECT version FROM schema_version');
-    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3, 4, 5]);
+    assert.deepEqual(rows.map((row) => row.version), [1, 2, 3, 4, 5, 6]);
   });
 
   it('une base déjà en version 2 ne reçoit que les migrations suivantes ; une migration qui échoue ne laisse rien', async () => {
@@ -55,14 +55,32 @@ describe('PostgreSQL', () => {
     try {
       const migrations = await loadMigrations();
       assert.deepEqual(await migrate(local, migrations.slice(0, 2)), [1, 2]);
-      assert.deepEqual(await migrate(local, migrations), [3, 4, 5]);
+      assert.deepEqual(await migrate(local, migrations), [3, 4, 5, 6]);
       assert.deepEqual(await migrate(local, migrations), []);
-      const broken = { version: 6, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
-      await assert.rejects(migrate(local, [...migrations, broken]), /migration 6 \(essai\)/);
+      const broken = { version: 7, name: 'essai', statements: ['CREATE TABLE essai_rollback (id text)', 'SELECT * FROM table_absente'] };
+      await assert.rejects(migrate(local, [...migrations, broken]), /migration 7 \(essai\)/);
       const { rows } = await local.query<{ found: string | null }>("SELECT to_regclass('essai_rollback')::text AS found");
       assert.equal(rows[0]?.found, null);
       const versions = await local.query<{ version: number }>('SELECT version FROM schema_version ORDER BY version');
-      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3, 4, 5]);
+      assert.deepEqual(versions.rows.map((row) => row.version), [1, 2, 3, 4, 5, 6]);
+    } finally {
+      await database.close();
+    }
+  });
+
+  it('migration 6 : les cartes déjà émises reçoivent leur type et une place', async () => {
+    const { PGlite } = await import('@electric-sql/pglite');
+    const database = new PGlite();
+    const local = database as unknown as Sql;
+    try {
+      const migrations = await loadMigrations();
+      await migrate(local, migrations.slice(0, 5));
+      for (const [id, tier] of [['acc_card_b', 'gold'], ['acc_card_a', 'gold'], ['acc_card_c', 'standard']]) {
+        await local.query('INSERT INTO issued_cards (account_id, space_id, card) VALUES ($1, $2, $3)', [id, 'spc_x', JSON.stringify({ accountId: id, spaceId: 'spc_x', tier, status: 'active' })]);
+      }
+      assert.deepEqual(await migrate(local, migrations), [6]);
+      const { rows } = await local.query<{ account_id: string; tier: string; slot: number }>('SELECT account_id, tier, slot FROM issued_cards ORDER BY account_id');
+      assert.deepEqual(rows.map((row) => [row.account_id, row.tier, row.slot]), [['acc_card_a', 'gold', 1], ['acc_card_b', 'gold', 2], ['acc_card_c', 'standard', 1]]);
     } finally {
       await database.close();
     }
@@ -148,6 +166,33 @@ describe('PostgreSQL', () => {
     assert.equal(cards.find((candidate) => candidate.accountId === card.accountId)?.status, 'frozen');
     const overview = await restarted.overview(citizen, 'spc_cit_mariama');
     assert.ok(overview.positions.some((position) => position.account.id === card.accountId));
+  });
+
+  it('deux instances : carte émise, bloquée, plafond et devis partagés par la base', async () => {
+    const one = (await loadDemoApp({ store })).app;
+    const two = (await loadDemoApp({ store })).app;
+    const card = await one.issueCard(citizen, 'spc_cit_mariama', { network: 'mastercard', tier: 'gold' }, 'pg-multi-1');
+    assert.ok((await two.overview(citizen, 'spc_cit_mariama')).positions.some((position) => position.account.id === card.accountId));
+
+    await one.setCardFrozen(citizen, 'spc_cit_mariama', 'acc_mc_card', true);
+    await assert.rejects(two.initiatePayment(citizen, 'spc_cit_mariama', {
+      sourceAccountId: 'acc_mc_card', amount: '5', destination: { type: 'own_account', accountId: 'acc_mc_om' },
+    }, 'pg-multi-frozen'), { code: 'invalid_state' });
+    await two.setCardFrozen(citizen, 'spc_cit_mariama', 'acc_mc_card', false);
+    assert.equal((await one.cards(citizen, 'spc_cit_mariama')).find((candidate) => candidate.accountId === 'acc_mc_card')?.status, 'active');
+
+    // Une carte Standard de démonstration : deux places. Quatre émissions simultanées, deux passent.
+    const results = await Promise.allSettled([one, two, one, two].map((app, index) => app.issueCard(citizen, 'spc_cit_mariama', { network: 'visa', tier: 'standard' }, `pg-multi-s${index}`)));
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 2);
+    const { rows } = await sql.query<{ n: string }>("SELECT count(*) AS n FROM issued_cards WHERE space_id = 'spc_cit_mariama' AND tier = 'standard'");
+    assert.equal(Number(rows[0]?.n), 3);
+
+    const quote = await one.quoteExchange(citizen, 'spc_cit_mariama', { sourceAccountId: 'acc_mc_om', targetAccountId: 'acc_mc_card', amount: '86500' });
+    const outcomes = await Promise.allSettled([
+      two.executeExchange(citizen, 'spc_cit_mariama', quote.id, 'pg-multi-x1'),
+      one.executeExchange(citizen, 'spc_cit_mariama', quote.id, 'pg-multi-x2'),
+    ]);
+    assert.deepEqual(outcomes.map((outcome) => outcome.status).sort(), ['fulfilled', 'rejected']);
   });
 
   it('un webhook déjà traité l’est encore après un redémarrage', async () => {
